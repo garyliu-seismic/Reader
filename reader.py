@@ -900,67 +900,29 @@ def load_html_file(path):
     chapters = scan_chapters(text)
     return text, chapters, title
 
-_MD_FENCE_RE = re.compile(r"^```")
-_MD_ATX_TITLE_RE = re.compile(r"^\s{0,3}#\s+(.+?)\s*#*\s*$")
+MD_EXTS = (".md", ".markdown")
+_MD_ATX_TITLE_RE = re.compile(r"^\s{0,3}#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$")
 _MD_SETEXT_TITLE_RE = re.compile(r"^([^\n]+)\n(=+)\s*$", re.MULTILINE)
-_MD_HR_RE = re.compile(r"^\s{0,3}(?:-{3,}|\*{3,}|_{3,})\s*$")
-_MD_BULLET_RE = re.compile(r"^(\s*)[-*+]\s+")
-_MD_BLOCKQUOTE_RE = re.compile(r"^(\s*)>\s?")
-_MD_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\([^)]*\)")
-_MD_LINK_RE = re.compile(r"\[([^\]]*)\]\([^)]*\)")
-_MD_BOLD_RE = re.compile(r"(\*\*|__)(.+?)\1")
-_MD_EM_RE = re.compile(r"(\*|_)(.+?)\1")
-_MD_INLINE_CODE_RE = re.compile(r"`([^`]*)`")
 
-def _markdown_to_text(md: str):
-    """Markdown → (清理后正文, 标题)。零依赖正则转换：ATX 标题行原样保留
-    （供 scan_chapters/CHAPTER_RE 识别为章节），其余内联语法去除/替换为可读符号。"""
-    title = ""
-    m = _MD_ATX_TITLE_RE.match(next((ln for ln in md.splitlines() if ln.strip()), ""))
+def md_title(text: str) -> str:
+    """从 markdown 提取书名：优先首个 ATX 标题，其次 setext(=) 标题。"""
+    m = _MD_ATX_TITLE_RE.match(next((ln for ln in text.splitlines() if ln.strip()), ""))
     if m:
-        title = m.group(1).strip()
-    else:
-        m = _MD_SETEXT_TITLE_RE.search(md)
-        if m:
-            title = m.group(1).strip()
-
-    out_lines = []
-    in_fence = False
-    for line in md.splitlines():
-        if _MD_FENCE_RE.match(line.strip()):
-            in_fence = not in_fence
-            continue
-        if in_fence:
-            out_lines.append(line)
-            continue
-        if _MD_HR_RE.match(line):
-            out_lines.append("")
-            continue
-        if _MD_ATX_TITLE_RE.match(line) or re.match(r"^\s{0,3}#{1,6}[ \t]+\S", line):
-            out_lines.append(line)  # 保留原始标题行，供 CHAPTER_RE 识别
-            continue
-        line = _MD_BLOCKQUOTE_RE.sub(r"\1", line)
-        line = _MD_BULLET_RE.sub(r"\1• ", line)
-        line = _MD_IMAGE_RE.sub(lambda mm: f"[图片: {mm.group(1)}]" if mm.group(1) else "[图片]", line)
-        line = _MD_LINK_RE.sub(r"\1", line)
-        line = _MD_BOLD_RE.sub(r"\2", line)
-        line = _MD_EM_RE.sub(r"\2", line)
-        line = _MD_INLINE_CODE_RE.sub(r"\1", line)
-        out_lines.append(line)
-
-    text = "\n".join(out_lines)
-    text = re.sub(r"[ \t\r]+", " ", text)
-    text = re.sub(r"\n\s*\n+", "\n\n", text)
-    return text.strip(), title
+        return m.group(1).strip()
+    m = _MD_SETEXT_TITLE_RE.search(text)
+    return m.group(1).strip() if m else ""
 
 def load_markdown(path):
-    """Markdown 文件 → (清理后正文, 章节, 标题)。"""
+    """Markdown 文件 → (原始正文, 章节, 书名)。
+
+    正文保持原始 markdown 不变，交给 LazyPager(md=True) 做富文本渲染
+    （标题分级 / 粗斜体 / 行内代码 / 代码块 / 列表 / 引用 / 表格 /
+    分隔线 / 链接）；这里只额外提取书名。"""
     with open(path, "rb") as f:
         raw = f.read()
     text = decode_text(raw)
-    text, title = _markdown_to_text(text)
     chapters = scan_chapters(text)
-    return text, chapters, title
+    return text, chapters, md_title(text)
 
 def load_pdf(path):
     """解析 PDF（仅限有文字层的，不支持扫描版）→ (全文, 章节, 书名)。
@@ -2023,7 +1985,7 @@ class MainWindow(QMainWindow):
         self.load_bar.hide()
         self.full_text = text
         self.view.set_layout(self._make_layout())
-        is_md = os.path.splitext(self.book_path)[1].lower() == ".md"
+        is_md = os.path.splitext(self.book_path)[1].lower() in MD_EXTS
         if is_md:
             chapters = md_chapters(text)
         self.pager = LazyPager(text, chapters, md=is_md)
