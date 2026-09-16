@@ -269,24 +269,80 @@ def parse_inline(s: str, base: int):
     walk(s, base, 0)
     return runs
 
-def _wrap_pieces(pieces, max_w, base_font):
-    """把片段按宽度折成若干显示行。每个片段=(文本,样式位,源起,源止)。"""
-    lines, cur, cur_w = [], [], 0.0
+def _wrap_pieces(pieces, max_w, base_font, word_wrap=True):
+    """把片段按宽度折成若干显示行。每个片段=(文本,样式位,源起,源止)。
+
+    word_wrap=True：英文按单词折行（不在单词中间断开），中文/无空格文本按字符折行。
+    word_wrap=False：完全按字符折行（保留行首/行内空格，用于代码块）。"""
+    if not word_wrap:
+        lines, cur, cur_w = [], [], 0.0
+        for (t, bits, s0, s1) in pieces:
+            f = _md_style_font(base_font, bits)
+            fm = QFontMetricsF(f)
+            rest, off = t, 0
+            while rest:
+                if cur and cur_w + 0.5 >= max_w:
+                    lines.append(cur)
+                    cur, cur_w = [], 0.0
+                k = _fit_chars(fm, rest, max_w - cur_w)
+                if k <= 0:
+                    k = 1
+                seg = rest[:k]
+                cur.append((seg, bits, s0 + off, s0 + off + k))
+                cur_w += fm.horizontalAdvance(seg)
+                rest, off = rest[k:], off + k
+        if cur:
+            lines.append(cur)
+        return lines
+    toks = []
     for (t, bits, s0, s1) in pieces:
+        i, n = 0, len(t)
+        while i < n:
+            j = i
+            if t[i] == " ":
+                while j < n and t[j] == " ":
+                    j += 1
+            else:
+                while j < n and t[j] != " ":
+                    j += 1
+            toks.append((t[i:j], bits, s0 + i, s0 + j, t[i] == " "))
+            i = j
+    lines, cur, cur_w = [], [], 0.0
+    for (tk, bits, ts0, ts1, is_sp) in toks:
         f = _md_style_font(base_font, bits)
         fm = QFontMetricsF(f)
-        rest, off = t, 0
+        if is_sp:
+            if not cur:
+                continue
+            tw = fm.horizontalAdvance(tk)
+            if cur_w + tw <= max_w:
+                cur.append((tk, bits, ts0, ts1))
+                cur_w += tw
+            continue
+        if cur and cur_w + fm.horizontalAdvance(tk) > max_w:
+            lines.append(cur)
+            cur, cur_w = [], 0.0
+        rest, roff = tk, 0
         while rest:
-            if cur and cur_w + 0.5 >= max_w:
+            avail = max_w - cur_w
+            if avail <= 0:
                 lines.append(cur)
                 cur, cur_w = [], 0.0
-            n = _fit_chars(fm, rest, max_w - cur_w)
-            if n <= 0:
-                n = 1
-            seg = rest[:n]
-            cur.append((seg, bits, s0 + off, s0 + off + n))
+                avail = max_w
+            if fm.horizontalAdvance(rest) <= avail:
+                cur.append((rest, bits, ts0 + roff, ts1))
+                cur_w += fm.horizontalAdvance(rest)
+                break
+            k = _fit_chars(fm, rest, avail)
+            if k <= 0:
+                k = 1
+            seg = rest[:k]
+            cur.append((seg, bits, ts0 + roff, ts0 + roff + k))
             cur_w += fm.horizontalAdvance(seg)
-            rest, off = rest[n:], off + n
+            rest = rest[k:]
+            roff += k
+            lines.append(cur)
+            cur, cur_w = [], 0.0
     if cur:
         lines.append(cur)
     return lines
@@ -574,7 +630,8 @@ def _render_code(blk, base, font, max_w, line_spacing, line_h, para_gap):
             lines.append(Line("", base + s, base + s, indent=0.0, style="code",
                               height=hh, ascent=asc))
             continue
-        wrapped = _wrap_pieces([(t, MD_CODE, base + s, base + s + len(t))], max_w, font)
+        wrapped = _wrap_pieces([(t, MD_CODE, base + s, base + s + len(t))], max_w, font,
+                               word_wrap=False)
         for w in wrapped:
             lines.append(_line_from_pieces(w, base + s, base + s + len(t),
                                            indent=0.0, style="code", height=hh, ascent=asc))
@@ -599,28 +656,19 @@ def _shrink_widths(widths, avail, min_w):
             ws[i] -= take * (room / cap)
     return ws
 
-def _render_table(blk, base, font, max_w, line_spacing, line_h, para_gap):
+def _table_lines(hprep, rprep, aligns, base, blk_start, blk_end, font, max_w, line_h, para_gap):
+    """通用表格排版：hprep/rprep 为 [(显示文本, 片段, 源偏移), ...]（源偏移为局部，加 base）。
+    列宽超页宽时自动收缩，单元格自动换行；markdown 与 PDF 表格共用。"""
     fm = QFontMetricsF(font)
     asc = fm.ascent()
     space_w = max(1.0, fm.horizontalAdvance(" "))
     sep = fm.horizontalAdvance("  ")
-
-    def prep(cells):
-        out = []
-        for (t, s) in cells:
-            pieces = parse_inline(t, base + s)
-            out.append(("".join(p[0] for p in pieces), pieces, s))
-        return out
-
-    hprep = prep(blk["header"])
-    rprep = [prep(r) for r in blk["rows"]]
-    ncol = max([len(hprep)] + [len(r) for r in rprep] + [len(blk["align"])])
-    aligns = (blk["align"] + ["left"] * ncol)[:ncol]
+    ncol = max([len(hprep)] + [len(r) for r in rprep] + [len(aligns)])
+    aligns = (list(aligns) + ["left"] * ncol)[:ncol]
     widths = [0.0] * ncol
     for row in [hprep] + rprep:
         for j, (disp, _p, _s) in enumerate(row):
             widths[j] = max(widths[j], fm.horizontalAdvance(disp))
-    # 超出页宽则收缩列宽（不窄于两个汉字），单元格自动换行
     avail = max_w - sep * max(0, ncol - 1)
     min_w = fm.horizontalAdvance("中") * 2.0
     if avail > 0 and sum(widths) > avail:
@@ -661,18 +709,31 @@ def _render_table(blk, base, font, max_w, line_spacing, line_h, para_gap):
                 if j < ncol - 1:
                     pieces.append(("  ", 0, ce, ce))
             out.append(_line_from_pieces(pieces,
-                                         row_s0 if row_s0 is not None else base + blk["start"],
-                                         row_s1 if row_s1 is not None else base + blk["start"],
+                                         row_s0 if row_s0 is not None else base + blk_start,
+                                         row_s1 if row_s1 is not None else base + blk_start,
                                          indent=0.0, height=line_h, ascent=asc))
         return out
 
     lines = row_lines(hprep, bold=True)
-    lines.append(Line("", base + blk["start"], base + blk["end"], indent=0.0,
+    lines.append(Line("", base + blk_start, base + blk_end, indent=0.0,
                       style="hr", height=line_h * 0.5, ascent=asc))
     for r in rprep:
         lines.extend(row_lines(r, bold=False))
     lines[-1].gap_after = para_gap
     return lines
+
+def _render_table(blk, base, font, max_w, line_spacing, line_h, para_gap):
+    def prep(cells):
+        out = []
+        for (t, s) in cells:
+            pieces = parse_inline(t, base + s)
+            out.append(("".join(p[0] for p in pieces), pieces, s))
+        return out
+
+    hprep = prep(blk["header"])
+    rprep = [prep(r) for r in blk["rows"]]
+    return _table_lines(hprep, rprep, blk["align"], base, blk["start"], blk["end"],
+                        font, max_w, line_h, para_gap)
 
 def render_md_lines(text, base_offset, font, max_w, line_spacing, para_spacing, line_h):
     """把一段 markdown 文本渲染成带样式与源偏移映射的 Line 列表（绝对偏移）。"""
@@ -740,9 +801,10 @@ class _Chapter:
 
 class LazyPager:
     """按章节惰性分页，只缓存最近几章，其余按需计算。"""
-    def __init__(self, text: str, chapters: List[Tuple[int, str]], md: bool = False):
+    def __init__(self, text: str, chapters: List[Tuple[int, str]], md: bool = False, pdf_blocks=None):
         self.text = text
         self.md = md
+        self.pdf_blocks = pdf_blocks
         self._params = {"font": QFont(), "page_size": QSizeF(400, 500),
                         "line_spacing": LINE_SPACING, "margin_x": MARGIN_X,
                         "margin_y": MARGIN_Y, "para_spacing": PARA_SPACING}
@@ -773,7 +835,14 @@ class LazyPager:
         if pages is None:
             c = self.chapters[ci]
             p = self._params
-            if self.md:
+            if self.pdf_blocks is not None:
+                max_w = p["page_size"].width() - 2 * p["margin_x"]
+                line_h = QFontMetricsF(p["font"]).height() * p["line_spacing"]
+                bs = [b for b in self.pdf_blocks if c.start <= b.get("start", 0) < c.end]
+                lines = render_pdf_lines(bs, p["font"], max_w, p["line_spacing"],
+                                         p.get("para_spacing", PARA_SPACING), line_h)
+                pages = _pack_lines(lines, p["page_size"].height() - 2 * p["margin_y"], line_h)
+            elif self.md:
                 max_w = p["page_size"].width() - 2 * p["margin_x"]
                 line_h = QFontMetricsF(p["font"]).height() * p["line_spacing"]
                 lines = render_md_lines(self.text[c.start:c.end], c.start, p["font"],
@@ -924,31 +993,509 @@ def load_markdown(path):
     chapters = scan_chapters(text)
     return text, chapters, md_title(text)
 
-def load_pdf(path):
-    """解析 PDF（仅限有文字层的，不支持扫描版）→ (全文, 章节, 书名)。
-    按原始页面逐页提取文字后拼接，不保留 PDF 原本的分页/排版 -- 交给
-    LazyPager 按字符重新分页，跟 epub/html/txt 走同一套流程。"""
+# ============ PDF 版式解析（保留标题/粗斜体/段落/列表/代码/表格） ============
+_PDF_MONO_HINTS = ("mono", "courier", "consola", "typewriter", "menlo", "code", "fixed")
+_PDF_BULLET_RE = re.compile(r"^\s*([\u2022\u00b7\u25aa\u25e6\u25cf\u25cb\u25c6\u25a0\u25a1\u203b\u2023\u2219]|[-\u2013\u2014*])\s+")
+_PDF_NUMBER_RE = re.compile(r"^\s*(\d{1,3}|[\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e]{1,3})[\.\u3001)\uff09]\s*")
+_PDF_PAGENO_RE = re.compile(r"^[\s\-\u2013\u2014\u00b7\.\u00b7|]*([ivxlcdmIVXLCDM]{1,7}|\d{1,4})[\s\-\u2013\u2014\u00b7\.\u00b7|]*$")
+_PDF_CJK_RANGES = ((0x3400, 0x4DBF), (0x4E00, 0x9FFF), (0x3000, 0x303F),
+                   (0x3040, 0x30FF), (0xAC00, 0xD7AF), (0xF900, 0xFAFF), (0xFF00, 0xFFEF))
+
+def _is_cjk(ch):
+    if not ch:
+        return False
+    o = ord(ch)
+    return any(a <= o <= b for a, b in _PDF_CJK_RANGES)
+
+def _pdf_span_bits(font, flags):
+    fn = (font or "").lower()
+    fl = int(flags or 0)
+    bits = 0
+    if (fl & 16) or any(k in fn for k in ("bold", "semibold", "-bd", "black", "heavy")):
+        bits |= MD_BOLD
+    if (fl & 2) or any(k in fn for k in ("italic", "oblique", "-it")):
+        bits |= MD_ITALIC
+    if (fl & 8) or any(k in fn for k in _PDF_MONO_HINTS):
+        bits |= MD_CODE
+    return bits
+
+def _pdf_line_text(ln):
+    return "".join(sp[0] for sp in ln["spans"])
+
+def _pdf_line_spans(ln):
+    return [(t.replace("\xad", ""), _pdf_span_bits(f, fl))
+            for (t, _sz, f, fl, _bb) in ln["spans"] if t]
+
+def _pdf_line_size(ln):
+    best, bn = 0.0, 0
+    for (t, sz, _f, _fl, _bb) in ln["spans"]:
+        n = len(t.strip())
+        if n > bn:
+            bn, best = n, sz
+    return best or (ln["spans"][0][1] if ln["spans"] else 0.0)
+
+def _pdf_line_mono(ln):
+    m = a = 0
+    for (t, _sz, f, fl, _bb) in ln["spans"]:
+        n = len(t.strip())
+        if not n:
+            continue
+        a += n
+        if _pdf_span_bits(f, fl) & MD_CODE:
+            m += n
+    return a > 0 and m >= a * 0.6
+
+def _pdf_drop_prefix(spans, n):
+    out = []
+    for (t, bits) in spans:
+        if n >= len(t):
+            n -= len(t)
+            continue
+        out.append((t[n:], bits))
+        n = 0
+    return out
+
+_PDF_TABLE_BUDGET = 6.0   # 表格识别的总时间预算（秒），避免大部头 PDF 打开过慢
+
+def _pdf_extract(path, progress=None):
+    import warnings
+    import pymupdf
+    warnings.filterwarnings("ignore", message=".*pymupdf_layout.*")
     try:
-        import pymupdf
-    except Exception as e:
-        raise RuntimeError("未安装 PyMuPDF，请执行：pip install pymupdf") from e
+        pymupdf.set_messages(stream=io.StringIO())   # 静默 pymupdf 的提示信息
+        pymupdf.no_recommend_layout()                # 不再推荐安装 pymupdf_layout
+    except Exception:
+        pass
     doc = pymupdf.open(path)
     try:
-        title = (doc.metadata or {}).get("title", "") or ""
-        parts = []
-        for page in doc:
-            t = page.get_text("text")
-            if t and t.strip():
-                parts.append(t.strip())
-        if not parts:
-            raise RuntimeError("此 PDF 没有可提取的文字层（可能是扫描版/图片 PDF，暂不支持，需要 OCR）")
+        title = ((doc.metadata or {}).get("title") or "").strip()
+        try:
+            toc = doc.get_toc() or []
+        except Exception:
+            toc = []
+        pages = []
+        n = len(doc)
+        tbl_deadline = time.time() + _PDF_TABLE_BUDGET
+        for pno in range(n):
+            if progress and (pno % 20 == 0 or pno == n - 1):
+                progress(15 + int(55 * pno / max(1, n)), "解析 PDF 版式… %d/%d 页" % (pno + 1, n))
+            page = doc[pno]
+            raw = page.get_text("dict")
+            lines = []
+            for b in raw.get("blocks", []):
+                if b.get("type") != 0:
+                    continue
+                for ln in b.get("lines", []):
+                    spans = []
+                    for s in ln.get("spans", []):
+                        t = s.get("text", "")
+                        if not t:
+                            continue
+                        spans.append((t, round(float(s.get("size", 0.0)), 1),
+                                      s.get("font", ""), int(s.get("flags", 0)),
+                                      tuple(s.get("bbox", (0, 0, 0, 0)))))
+                    if spans and any(t.strip() for (t, *_r) in spans):
+                        lines.append({"bbox": tuple(ln.get("bbox", (0, 0, 0, 0))), "spans": spans})
+            tables = []
+            # 表格识别很贵：仅当页面有较多线条、且在时间预算内才做
+            if time.time() < tbl_deadline and len(page.get_drawings()) >= 12:
+                try:
+                    for t in page.find_tables().tables:
+                        data = t.extract()
+                        if data and any(any((c or "").strip() for c in row) for row in data):
+                            tables.append((tuple(t.bbox), [[(c or "").strip() for c in row] for row in data]))
+                except Exception:
+                    pass
+            pages.append({"lines": lines, "tables": tables, "height": float(page.rect.height)})
     finally:
         doc.close()
-    text = "\n\n".join(parts)
-    text = re.sub(r"[ \t\r]+", " ", text)
-    text = re.sub(r"\n\s*\n+", "\n\n", text)
-    chapters = scan_chapters(text)
-    return text, chapters, title.strip()
+    return title, toc, pages
+
+def _pdf_body_size(pages):
+    hist = {}
+    for pg in pages:
+        for ln in pg["lines"]:
+            for (t, sz, _f, _fl, _bb) in ln["spans"]:
+                w = len(t.strip())
+                if w:
+                    hist[sz] = hist.get(sz, 0) + w
+    return max(hist.items(), key=lambda kv: kv[1])[0] if hist else 12.0
+
+def _pdf_running_keys(pages):
+    from collections import Counter
+    cnt = Counter()
+    for pg in pages:
+        seen = set()
+        for ln in pg["lines"]:
+            t = _pdf_line_text(ln).strip()
+            if not t or len(t) > 70:
+                continue
+            k = re.sub(r"\d+", "#", t)
+            if k not in seen:
+                seen.add(k)
+                cnt[k] += 1
+    thr = max(3, int(len(pages) * 0.3))
+    return {k for k, v in cnt.items() if v >= thr}
+
+def _pdf_head_level(sz, body):
+    r = sz / max(1.0, body)
+    if r >= 1.85:
+        return 1
+    if r >= 1.42:
+        return 2
+    if r >= 1.26:
+        return 3
+    if r >= 1.14:
+        return 4
+    if r >= 1.07:
+        return 5
+    return 0
+
+def _pdf_build(pages, body, running):
+    blocks = []
+    para, prev = None, None
+    for pi, pg in enumerate(pages):
+        ph = pg.get("height", 0.0)
+        elems = []
+        for ln in pg["lines"]:
+            txt = _pdf_line_text(ln).strip()
+            if not txt:
+                continue
+            if re.sub(r"\d+", "#", txt) in running:
+                continue
+            y0 = ln["bbox"][1]
+            if _PDF_PAGENO_RE.match(txt) and ph and (y0 < ph * 0.08 or y0 > ph * 0.9):
+                continue
+            elems.append(("line", y0, ln))
+        for (bb, data) in pg.get("tables", []):
+            elems.append(("table", bb[1], data))
+        elems.sort(key=lambda e: e[1])
+        # 页内正文左边距与行距中位数（用于段落切分）
+        body_xs, body_x1s, gaps, prev_bottom = [], [], [], None
+        for (k, _y, ln) in elems:
+            if k != "line":
+                continue
+            if _pdf_head_level(_pdf_line_size(ln), body) == 0 and not _pdf_line_mono(ln):
+                body_xs.append(ln["bbox"][0])
+                body_x1s.append(ln["bbox"][2])
+            if prev_bottom is not None:
+                gg = ln["bbox"][1] - prev_bottom
+                if 0 <= gg < body * 3:
+                    gaps.append(gg)
+            prev_bottom = ln["bbox"][3]
+        left = min(body_xs) if body_xs else 0.0
+        gaps.sort()
+        med_gap = gaps[len(gaps) // 2] if gaps else body * 0.2
+        para_thr = max(med_gap * 1.8, body * 0.5)
+        indent_x = left + max(6.0, body * 1.1)
+        right = max(body_x1s) if body_x1s else 0.0
+
+        for (k, _y, obj) in elems:
+            if k == "table":
+                if para is not None and para["spans"]:
+                    blocks.append(para)
+                para, prev = None, None
+                rows = [[c for c in r] for r in obj]
+                blocks.append({"type": "table", "page": pi, "rows": rows,
+                               "align": ["left"] * max((len(r) for r in rows), default=1)})
+                continue
+            ln = obj
+            ltxt = _pdf_line_text(ln)
+            stripped = ltxt.strip()
+            if not stripped:
+                continue
+            soft_break = stripped.endswith("\xad")
+            spans = _pdf_line_spans(ln)
+            lsz = _pdf_line_size(ln)
+            bits_line = 0
+            for (_t, _b) in spans:
+                bits_line |= _b
+            mono = _pdf_line_mono(ln)
+            gap = (ln["bbox"][1] - prev["bottom"]) if prev and prev.get("page") == pi else None
+            x0 = ln["bbox"][0]
+            full = bool(right) and ln["bbox"][2] >= right - body * 1.5
+            lev = _pdf_head_level(lsz, body)
+            if not lev and (bits_line & MD_BOLD) and len(stripped) <= 64 \
+               and gap is not None and gap > body * 0.8:
+                lev = 3
+            m_bullet = _PDF_BULLET_RE.match(ltxt)
+            m_num = None if m_bullet else _PDF_NUMBER_RE.match(ltxt)
+            if lev:
+                if para is not None and para["spans"]:
+                    blocks.append(para)
+                blocks.append({"type": "heading", "level": lev, "spans": spans, "page": pi})
+                para, prev = None, {"text": stripped, "bottom": ln["bbox"][3], "page": pi, "full": full}
+                continue
+            if m_bullet or m_num:
+                if para is not None and para["spans"]:
+                    blocks.append(para)
+                mm = m_num or m_bullet
+                blocks.append({"type": "list", "marker": mm.group(0).strip(),
+                               "depth": 0 if x0 < indent_x else 1,
+                               "spans": _pdf_drop_prefix(spans, mm.end()), "page": pi})
+                para, prev = None, {"text": stripped, "bottom": ln["bbox"][3], "page": pi, "full": full}
+                continue
+            if mono:
+                if para is not None and para["type"] == "code":
+                    para["spans"].append(("\n", 0))
+                    para["spans"].extend(spans)
+                else:
+                    if para is not None and para["spans"]:
+                        blocks.append(para)
+                    para = {"type": "code", "spans": list(spans), "page": pi}
+                prev = {"text": stripped, "bottom": ln["bbox"][3], "page": pi, "full": full}
+                continue
+            # 正文段落
+            if para is not None and para["type"] != "para":
+                if para["spans"]:
+                    blocks.append(para)
+                para = None
+            new = para is None
+            if not new and prev is not None:
+                if gap is not None:
+                    if gap > para_thr or x0 > indent_x:
+                        new = True
+                elif not prev.get("full", True):   # 跨页：上一行非满行则新段，否则续段
+                    new = True
+            if new:
+                if para is not None and para["spans"]:
+                    blocks.append(para)
+                para = {"type": "para", "spans": [], "page": pi}
+            elif prev is not None:
+                ptxt = prev["text"]
+                cont = ((ptxt.endswith("-") and len(ptxt) >= 2 and ptxt[-2].isalnum()
+                         and stripped[:1].isalnum())
+                        or (prev.get("soft") and stripped[:1].isalnum()))
+                if cont:
+                    if para["spans"]:
+                        lt, lb = para["spans"][-1]
+                        if lt.endswith("-"):
+                            para["spans"][-1] = (lt[:-1], lb)
+                elif not (_is_cjk(ptxt[-1:]) or _is_cjk(stripped[:1])):
+                    para["spans"].append((" ", 0))
+            para["spans"].extend(spans)
+            prev = {"text": stripped, "bottom": ln["bbox"][3], "soft": soft_break,
+                    "page": pi, "full": full}
+    if para is not None and para["spans"]:
+        blocks.append(para)
+    return blocks
+
+def _pdf_serialize(blocks):
+    buf, pos = [], 0
+    for b in blocks:
+        if buf:
+            buf.append("\n\n")
+            pos += 2
+        b["start"] = pos
+        if b["type"] == "table":
+            cells = []
+            for r in b.pop("rows", []):
+                row = []
+                for c in r:
+                    row.append((c, pos))
+                    buf.append(c)
+                    pos += len(c)
+                    buf.append("  ")
+                    pos += 2
+                buf.append("\n")
+                pos += 1
+                cells.append(row)
+            b["cells"] = cells
+        else:
+            pieces = []
+            for (t, bits) in b.pop("spans", []):
+                s0 = pos
+                buf.append(t)
+                pos += len(t)
+                pieces.append((t, bits, s0, pos))
+            b["pieces"] = pieces
+    return "".join(buf), blocks
+
+def _pdf_page_offsets(blocks, npages):
+    offs = [None] * npages
+    for b in blocks:
+        p = b.get("page")
+        if p is not None and 0 <= p < npages and offs[p] is None:
+            offs[p] = b["start"]
+    last = 0
+    for i in range(npages):
+        if offs[i] is None:
+            offs[i] = last
+        else:
+            last = offs[i]
+    return offs
+
+def _block_text(b):
+    return "".join(p[0] for p in b.get("pieces", []))
+
+def _norm_title(s):
+    return re.sub(r"[\s\-\u2013\u2014_\u00b7\.\u3002\uff0c,\u3001:\uff1a;\uff1b!\uff01?\uff1f'\"\u201c\u201d\u2018\u2019()\uff08\uff09\[\]\u3010\u3011]+", "", (s or "").lower())
+
+def _pdf_chapters(blocks, toc, text, page_offsets):
+    if toc:
+        by_page = {}
+        for b in blocks:
+            by_page.setdefault(b.get("page", -1), []).append(b)
+        used, chapters = set(), []
+        for item in toc:
+            lvl, title, pno = item[0], item[1], item[2] if len(item) > 2 else 1
+            key = _norm_title(title)
+            off = None
+            if key:
+                for b in by_page.get(pno - 1, []):
+                    if id(b) in used or b["type"] != "heading":
+                        continue
+                    bt = _norm_title(_block_text(b))
+                    if bt and (bt == key or key in bt or bt in key):
+                        off = b["start"]
+                        used.add(id(b))
+                        break
+            if off is None and 0 <= pno - 1 < len(page_offsets):
+                off = page_offsets[pno - 1]
+            chapters.append((off if off is not None else 0, (title or "").strip() or "—"))
+        chapters.sort(key=lambda x: x[0])
+        ded = []
+        for off, t in chapters:
+            if ded and off <= ded[-1][0]:
+                continue
+            ded.append((off, t))
+        if ded and ded[0][0] != 0:
+            ded.insert(0, (0, "开篇"))
+        if ded:
+            return ded
+    hs = [b for b in blocks if b["type"] == "heading" and b.get("level", 9) <= 2]
+    if hs:
+        ch = [(b["start"], _block_text(b).strip()[:60] or "—") for b in hs]
+        if ch and ch[0][0] != 0:
+            ch.insert(0, (0, "开篇"))
+        return ch
+    return scan_chapters(text)
+
+def _render_pdf_para(blk, font, max_w, line_h, para_gap):
+    fm = QFontMetricsF(font)
+    asc = fm.ascent()
+    wrapped = _wrap_pieces(blk["pieces"], max_w, font)
+    lines = [_line_from_pieces(w, (w[0][2] if w else blk["start"]),
+                               (w[-1][3] if w else blk["start"]),
+                               indent=0.0, height=line_h, ascent=asc) for w in wrapped]
+    if lines:
+        lines[-1].gap_after = para_gap
+    return lines
+
+def _render_pdf_heading(blk, font, max_w, line_spacing, line_h):
+    level = max(1, min(6, blk.get("level", 3)))
+    hf = _md_heading_font(font, level)
+    hfm = QFontMetricsF(hf)
+    asc = hfm.ascent()
+    hh = hfm.height() * line_spacing * (1.15 if level <= 2 else 1.0)
+    wrapped = _wrap_pieces(blk["pieces"], max_w, hf)
+    lines = [_line_from_pieces(w, (w[0][2] if w else blk["start"]),
+                               (w[-1][3] if w else blk["start"]),
+                               style="h%d" % level, height=hh, ascent=asc, indent=0.0)
+             for w in wrapped]
+    if lines:
+        lines[-1].gap_after = MD_H_GAP.get(level, 0.4) * line_h
+    return lines
+
+def _render_pdf_code(blk, font, max_w, line_spacing, line_h, para_gap):
+    cf = _md_mono_font(font)
+    cfm = QFontMetricsF(cf)
+    asc = cfm.ascent()
+    hh = cfm.height() * line_spacing
+    rows, cur = [], []
+    for (t, bits, s0, s1) in blk["pieces"]:
+        start = 0
+        for m in re.finditer("\n", t):
+            if m.start() > start:
+                cur.append((t[start:m.start()], bits | MD_CODE, s0 + start, s0 + m.start()))
+            rows.append(cur)
+            cur = []
+            start = m.end()
+        if start < len(t):
+            cur.append((t[start:], bits | MD_CODE, s0 + start, s1))
+    rows.append(cur)
+    out = []
+    for w in rows:
+        if not w:
+            out.append(Line("", blk["start"], blk["start"], indent=0.0, style="code",
+                            height=hh, ascent=asc))
+            continue
+        for wl in _wrap_pieces(w, max_w, font, word_wrap=False):
+            out.append(_line_from_pieces(wl, wl[0][2], wl[-1][3], indent=0.0,
+                                         style="code", height=hh, ascent=asc))
+    if out:
+        out[-1].gap_after = para_gap
+    return out
+
+def _render_pdf_list(blk, font, max_w, line_h, para_gap):
+    fm = QFontMetricsF(font)
+    asc = fm.ascent()
+    marker = blk.get("marker", "\u2022")
+    content_indent = blk.get("depth", 0) * MD_LIST_INDENT + fm.horizontalAdvance(marker) + 8.0
+    wrapped = _wrap_pieces(blk["pieces"], max_w - content_indent, font)
+    lines = []
+    for k, w in enumerate(wrapped):
+        lines.append(_line_from_pieces(w, (w[0][2] if w else blk["start"]),
+                                       (w[-1][3] if w else blk["start"]),
+                                       indent=content_indent, marker=(marker if k == 0 else None),
+                                       height=line_h, ascent=asc))
+    if lines:
+        lines[-1].gap_after = para_gap * 0.4
+    return lines
+
+def _render_pdf_table(blk, font, max_w, line_h, para_gap):
+    cells = blk.get("cells") or []
+    if not cells:
+        return []
+
+    def prep(row):
+        out = []
+        for (t, off) in row:
+            pieces = [(t, 0, off, off + len(t))] if t else []
+            out.append((t, pieces, off))
+        return out
+
+    hprep = prep(cells[0])
+    rprep = [prep(r) for r in cells[1:]]
+    return _table_lines(hprep, rprep, blk.get("align") or [], 0, blk["start"], blk["start"],
+                        font, max_w, line_h, para_gap)
+
+def render_pdf_lines(blocks, font, max_w, line_spacing, para_spacing, line_h):
+    """把 PDF 版式块渲染成带样式与源偏移映射的 Line 列表（偏移为绝对）。"""
+    fm = QFontMetricsF(font)
+    para_gap = fm.height() * para_spacing
+    out = []
+    for b in blocks:
+        t = b["type"]
+        if t == "heading":
+            out.extend(_render_pdf_heading(b, font, max_w, line_spacing, line_h))
+        elif t == "code":
+            out.extend(_render_pdf_code(b, font, max_w, line_spacing, line_h, para_gap))
+        elif t == "list":
+            out.extend(_render_pdf_list(b, font, max_w, line_h, para_gap))
+        elif t == "table":
+            out.extend(_render_pdf_table(b, font, max_w, line_h, para_gap))
+        else:
+            out.extend(_render_pdf_para(b, font, max_w, line_h, para_gap))
+    return out
+
+def load_pdf(path, progress=None):
+    """解析 PDF（仅限有文字层的，不支持扫描版）→ (全文, 章节, 书名, 版式块)。
+    保留标题层级 / 粗体斜体 / 段落 / 列表 / 代码 / 表格，交给 LazyPager 富文本渲染。"""
+    try:
+        import pymupdf  # noqa: F401
+    except Exception as e:
+        raise RuntimeError("未安装 PyMuPDF，请执行：pip install pymupdf") from e
+    title, toc, pages = _pdf_extract(path, progress)
+    if not any(pg["lines"] for pg in pages):
+        raise RuntimeError("此 PDF 没有可提取的文字层（可能是扫描版/图片 PDF，暂不支持，需要 OCR）")
+    body = _pdf_body_size(pages)
+    running = _pdf_running_keys(pages)
+    blocks = _pdf_build(pages, body, running)
+    text, blocks = _pdf_serialize(blocks)
+    page_offsets = _pdf_page_offsets(blocks, len(pages))
+    chapters = _pdf_chapters(blocks, toc, text, page_offsets)
+    return text, chapters, title, {"blocks": blocks}
 
 def load_kindle(path):
     """解析 Kindle 格式（mobi/azw/azw3/prc）→ (全文, 章节, 书名)。
@@ -976,13 +1523,14 @@ def load_kindle(path):
 
 # ============ 后台加载（不阻塞 UI） ============
 class BookLoader(QObject):
-    loaded = Signal(str, list, str)   # (全文, 章节, 书名)
+    loaded = Signal(str, list, str, object)   # (全文, 章节, 书名, 版式块)
     failed = Signal(str)
     progress = Signal(int, str)       # (百分比, 说明)
     def __init__(self, path):
         super().__init__()
         self.path = path
     def run(self):
+        extra = None
         try:
             ext = os.path.splitext(self.path)[1].lower()
             if ext == ".epub":
@@ -996,7 +1544,8 @@ class BookLoader(QObject):
                 text, chapters, title = load_kindle(self.path)
             elif ext == ".pdf":
                 self.progress.emit(10, "解析 PDF…")
-                text, chapters, title = load_pdf(self.path)
+                text, chapters, title, extra = load_pdf(
+                    self.path, progress=lambda p, m: self.progress.emit(p, m))
             elif ext in (".md", ".markdown"):
                 self.progress.emit(10, "解析 Markdown…")
                 text, chapters, title = load_markdown(self.path)
@@ -1012,7 +1561,7 @@ class BookLoader(QObject):
                 chapters = scan_chapters(text)
                 title = ""
             self.progress.emit(95, "完成")
-            self.loaded.emit(text, chapters, title)
+            self.loaded.emit(text, chapters, title, extra)
         except Exception as e:
             self.failed.emit(str(e))
 
@@ -1981,14 +2530,15 @@ class MainWindow(QMainWindow):
         self.load_bar.hide()
         QMessageBox.critical(self, "错误", msg)
 
-    def _on_book_loaded(self, text, chapters, title=""):
+    def _on_book_loaded(self, text, chapters, title="", extra=None):
         self.load_bar.hide()
         self.full_text = text
         self.view.set_layout(self._make_layout())
         is_md = os.path.splitext(self.book_path)[1].lower() in MD_EXTS
         if is_md:
             chapters = md_chapters(text)
-        self.pager = LazyPager(text, chapters, md=is_md)
+        pdf_blocks = extra.get("blocks") if isinstance(extra, dict) else None
+        self.pager = LazyPager(text, chapters, md=is_md, pdf_blocks=pdf_blocks)
         self.pager.set_params(self.view.pagination_params())
         self.view.full_text = text
         self.view.book_title = title or os.path.splitext(os.path.basename(self.book_path))[0]
