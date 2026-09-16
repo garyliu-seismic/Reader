@@ -41,10 +41,14 @@ CLICK_ZONE = 0.28       # 单击左右两侧翻页的触发宽度（占窗口比
 
 # ============ 分页（只分"一章"的量，所以永远很快） ============
 class Line:
-    __slots__ = ("text", "start", "end", "indent", "gap_after")
-    def __init__(self, text, start, end, indent=False, gap_after=0.0):
+    __slots__ = ("text", "start", "end", "indent", "gap_after",
+                 "runs", "style", "marker", "height", "ascent", "map")
+    def __init__(self, text, start, end, indent=False, gap_after=0.0,
+                 runs=None, style=None, marker=None, height=None, ascent=None, map=None):
         self.text, self.start, self.end = text, start, end
         self.indent, self.gap_after = indent, gap_after
+        self.runs, self.style, self.marker = runs, style, marker
+        self.height, self.ascent, self.map = height, ascent, map
 
 class Page:
     __slots__ = ("index", "start", "end", "lines")
@@ -91,7 +95,8 @@ def paginate(text: str, font: QFont, page_size: QSizeF, base_offset: int = 0,
         while rest:
             w = max_w - (indent_w if (use_indent and first) else 0.0)
             ln, rest = wrap_line(fm, rest, w)
-            lines.append(Line(ln, off, off + len(ln), indent=(use_indent and first)))
+            lines.append(Line(ln, off, off + len(ln),
+                              indent=(indent_w if (use_indent and first) else 0.0)))
             off += len(ln)
             first = False
         lines[-1].gap_after = para_gap          # 段末留白（段间距）
@@ -108,6 +113,607 @@ def paginate(text: str, font: QFont, page_size: QSizeF, base_offset: int = 0,
         pages.append(Page(len(pages), cur[0].start, cur[-1].end, cur))
     return pages
 
+# ============ Markdown 渲染（接近专业 md 阅读器） ============
+# 行内样式位
+MD_BOLD = 1
+MD_ITALIC = 2
+MD_CODE = 4
+MD_STRIKE = 8
+MD_LINK = 16
+
+# 标题字号缩放（相对正文字号）与段后间距（正文行高倍数）
+MD_H_SCALE = {1: 1.9, 2: 1.55, 3: 1.3, 4: 1.12, 5: 1.0, 6: 0.92}
+MD_H_GAP = {1: 0.9, 2: 0.7, 3: 0.55, 4: 0.45, 5: 0.35, 6: 0.3}
+MD_LIST_INDENT = 24.0      # 每层列表缩进（像素）
+MD_QUOTE_INDENT = 18.0     # 引用缩进
+MD_BAR_W = 3.0             # 引用竖线宽度
+MD_CODE_BG = "#f2f2ef"     # 代码块背景
+MD_INLINE_CODE_BG = "#eef0f1"
+MD_LINK_COLOR = "#0b6bcb"
+MD_INLINE_CODE_COLOR = "#c7254e"
+MD_QUOTE_COLOR = "#6a6a6a"
+MD_BAR_COLOR = "#c9c9c9"
+MD_HR_COLOR = "#d6d6d6"
+
+# markdown 分页单元：以 H1 为章（无 H1 则整篇连续排版，更像 md 阅读器）
+MD_CHAPTER_RE = re.compile(r"^#[ \t]+(.+?)[ \t]*#*[ \t]*\r?$", re.MULTILINE)
+# 目录用：所有 H1-H6 标题
+MD_HEAD_RE = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*\r?$", re.MULTILINE)
+
+def md_chapters(text):
+    chapters = [(m.start(), m.group(1).strip()) for m in MD_CHAPTER_RE.finditer(text)]
+    if not chapters:
+        return [(0, "正文")]
+    if chapters[0][0] != 0:
+        chapters.insert(0, (0, "开篇"))
+    return chapters
+
+def _md_mono_font(base: QFont) -> QFont:
+    f = QFont(base)
+    f.setFamilies(["Consolas", "Courier New", "Menlo", "DejaVu Sans Mono", "monospace"])
+    f.setPointSizeF(base.pointSizeF() * 0.94)
+    return f
+
+def _md_style_font(base: QFont, bits: int) -> QFont:
+    f = _md_mono_font(base) if (bits & MD_CODE) else QFont(base)
+    if bits & MD_BOLD:
+        f.setBold(True)
+    if bits & MD_ITALIC:
+        f.setItalic(True)
+    return f
+
+def _md_heading_font(base: QFont, level: int) -> QFont:
+    f = QFont(base)
+    f.setPointSizeF(base.pointSizeF() * MD_H_SCALE.get(level, 1.0))
+    f.setBold(True)
+    return f
+
+def _fit_chars(fm: QFontMetricsF, text: str, max_w: float) -> int:
+    if not text or max_w <= 0:
+        return 0
+    if fm.horizontalAdvance(text) <= max_w:
+        return len(text)
+    lo, hi = 1, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if fm.horizontalAdvance(text[:mid]) <= max_w:
+            lo = mid
+        else:
+            hi = mid - 1
+    return max(lo, 1)
+
+_INLINE_ESCAPE = set("\\`*_~[]()#!<>")
+
+def parse_inline(s: str, base: int):
+    """解析一行 markdown 内联文本 → 片段 [(显示文本, 样式位, 源起, 源止)]（绝对偏移）。"""
+    runs = []
+
+    def walk(t, off, add_bits):
+        i, n, plain = 0, len(t), 0
+
+        def flush(j):
+            nonlocal plain
+            if j > plain:
+                runs.append((t[plain:j], add_bits, off + plain, off + j))
+            plain = j
+
+        while i < n:
+            c = t[i]
+            if c == "\\" and i + 1 < n and t[i + 1] in _INLINE_ESCAPE:
+                flush(i)
+                runs.append((t[i + 1], add_bits, off + i, off + i + 2))
+                i += 2
+                plain = i
+                continue
+            if c == "`":
+                m = re.match(r"`+", t[i:])
+                ticks = m.group(0)
+                close = t.find(ticks, i + len(ticks))
+                if close != -1:
+                    flush(i)
+                    runs.append((t[i + len(ticks):close], add_bits | MD_CODE,
+                                 off + i + len(ticks), off + close))
+                    i = close + len(ticks)
+                    plain = i
+                    continue
+            if c == "!" and i + 1 < n and t[i + 1] == "[":
+                j = t.find("]", i + 2)
+                if j != -1 and j + 1 < n and t[j + 1] == "(":
+                    k = t.find(")", j + 2)
+                    if k != -1:
+                        flush(i)
+                        walk(t[i + 2:j], off + i + 2, add_bits | MD_LINK)
+                        i = k + 1
+                        plain = i
+                        continue
+            if c == "[":
+                j = t.find("]", i + 1)
+                if j != -1 and j + 1 < n and t[j + 1] == "(":
+                    k = t.find(")", j + 2)
+                    if k != -1:
+                        flush(i)
+                        walk(t[i + 1:j], off + i + 1, add_bits | MD_LINK)
+                        i = k + 1
+                        plain = i
+                        continue
+            if c in ("*", "_"):
+                d2 = t[i:i + 2]
+                delim = d2 if (len(d2) == 2 and d2[0] == d2[1]) else c
+                close = t.find(delim, i + len(delim))
+                if close != -1:
+                    flush(i)
+                    bits = MD_BOLD if len(delim) == 2 else MD_ITALIC
+                    walk(t[i + len(delim):close], off + i + len(delim), add_bits | bits)
+                    i = close + len(delim)
+                    plain = i
+                    continue
+            if c == "~" and i + 1 < n and t[i + 1] == "~":
+                close = t.find("~~", i + 2)
+                if close != -1:
+                    flush(i)
+                    walk(t[i + 2:close], off + i + 2, add_bits | MD_STRIKE)
+                    i = close + 2
+                    plain = i
+                    continue
+            if c == "&":
+                m = re.match(r"&[a-zA-Z][a-zA-Z0-9]*;|&#[0-9]+;", t[i:])
+                if m:
+                    flush(i)
+                    runs.append((html.unescape(m.group(0)), add_bits, off + i, off + i + m.end()))
+                    i += m.end()
+                    plain = i
+                    continue
+            i += 1
+        flush(n)
+
+    walk(s, base, 0)
+    return runs
+
+def _wrap_pieces(pieces, max_w, base_font):
+    """把片段按宽度折成若干显示行。每个片段=(文本,样式位,源起,源止)。"""
+    lines, cur, cur_w = [], [], 0.0
+    for (t, bits, s0, s1) in pieces:
+        f = _md_style_font(base_font, bits)
+        fm = QFontMetricsF(f)
+        rest, off = t, 0
+        while rest:
+            if cur and cur_w + 0.5 >= max_w:
+                lines.append(cur)
+                cur, cur_w = [], 0.0
+            n = _fit_chars(fm, rest, max_w - cur_w)
+            if n <= 0:
+                n = 1
+            seg = rest[:n]
+            cur.append((seg, bits, s0 + off, s0 + off + n))
+            cur_w += fm.horizontalAdvance(seg)
+            rest, off = rest[n:], off + n
+    if cur:
+        lines.append(cur)
+    return lines
+
+def _line_from_pieces(pieces, start, end, **kw):
+    text = "".join(p[0] for p in pieces)
+    runs, mp, d = [], [], 0
+    for (t, bits, s0, s1) in pieces:
+        runs.append((d, len(t), bits))
+        mp.append((d, d + len(t), s0, s1))
+        d += len(t)
+    return Line(text, start, end, runs=runs, map=mp, **kw)
+
+def _line_disp_to_src(ln: Line, d: int) -> int:
+    if not ln.map:
+        return ln.start + d
+    for d0, d1, s0, s1 in ln.map:
+        if d0 <= d < d1:
+            return s0 + (d - d0)
+    return ln.map[-1][3] if ln.map else ln.end
+
+def _line_src_to_disp(ln: Line, s: int) -> int:
+    if not ln.map:
+        return s - ln.start
+    last = 0
+    for d0, d1, s0, s1 in ln.map:
+        if s0 <= s < s1:
+            return d0 + (s - s0)
+        last = d1
+    return last
+
+def _pieces_from_lines(plines, base):
+    pieces = []
+    for idx, (t, s) in enumerate(plines):
+        pieces.extend(parse_inline(t, base + s))
+        if idx < len(plines) - 1:
+            nl = s + len(t)
+            pieces.append((" ", 0, base + nl, base + nl + 1))
+    return pieces
+
+def _md_split_lines(text):
+    res, i, n = [], 0, len(text)
+    while i < n:
+        j = text.find("\n", i)
+        if j == -1:
+            j = n
+        e = j
+        if e > i and text[e - 1] == "\r":
+            e -= 1
+        res.append((text[i:e], i))
+        if j == n:
+            break
+        i = j + 1
+    return res
+
+def _is_hr(lt):
+    s = lt.strip()
+    if s.startswith("|"):
+        return False
+    return bool(re.match(r"^(\*\s*){3,}$|^(-\s*){3,}$|^(_\s*){3,}$", s))
+
+def _is_list_item(lt):
+    return re.match(r"^(\s*)([-*+]|\d+[.)])\s+", lt) is not None
+
+def _is_table_sep(lt):
+    s = lt.strip()
+    if not s.startswith("|") or not s.endswith("|"):
+        return False
+    cells = s.strip("|").split("|")
+    return bool(cells) and all(re.match(r"^:?-{1,}:?$", c.strip()) for c in cells)
+
+def _split_table_row(lt, ls):
+    cells, i = [], 0
+    while i < len(lt) and lt[i] in " \t":
+        i += 1
+    if i < len(lt) and lt[i] == "|":
+        i += 1
+    while True:
+        j = lt.find("|", i)
+        if j == -1:
+            j = len(lt)
+        raw = lt[i:j]
+        lead = len(raw) - len(raw.lstrip(" \t"))
+        cells.append((raw.strip(), ls + i + lead))
+        if j == len(lt):
+            break
+        i = j + 1
+    return cells
+
+def _parse_aligns(lt):
+    aligns = []
+    for part in lt.strip().strip("|").split("|"):
+        p = part.strip()
+        if p.startswith(":") and p.endswith(":"):
+            aligns.append("center")
+        elif p.endswith(":"):
+            aligns.append("right")
+        else:
+            aligns.append("left")
+    return aligns
+
+def _md_blocks(text):
+    lines = _md_split_lines(text)
+    blocks, i, n = [], 0, len(lines)
+
+    def line_end(k):
+        if k >= n:
+            return len(text)
+        lt, ls = lines[k]
+        return ls + len(lt) + (1 if ls + len(lt) < len(text) else 0)
+
+    def is_block_start(lt, nxt):
+        s = lt.strip()
+        if re.match(r"^(#{1,6})[ \t]+", lt):
+            return True
+        if re.match(r"^(`{3,}|~{3,})", lt):
+            return True
+        if _is_hr(lt) or _is_list_item(lt) or lt.startswith(">"):
+            return True
+        if nxt is not None and s.startswith("|") and _is_table_sep(nxt):
+            return True
+        return False
+
+    while i < n:
+        lt, ls = lines[i]
+        if not lt.strip():
+            i += 1
+            continue
+        m = re.match(r"^(#{1,6})[ \t]+(.*)$", lt)
+        if m:
+            content = re.sub(r"[ \t]+#+[ \t]*$", "", m.group(2)).strip()
+            blocks.append({"type": "heading", "level": len(m.group(1)),
+                           "content": content, "content_start": ls + m.start(2),
+                           "start": ls, "end": line_end(i)})
+            i += 1
+            continue
+        m = re.match(r"^(`{3,}|~{3,})[ \t]*(.*)$", lt)
+        if m:
+            fence_ch, fence_len = m.group(1)[0], len(m.group(1))
+            lang = m.group(2).strip()
+            j, body = i + 1, []
+            while j < n:
+                if re.match(r"^" + re.escape(fence_ch) + r"{%d,}[ \t]*$" % fence_len, lines[j][0].strip()):
+                    break
+                body.append(lines[j])
+                j += 1
+            blocks.append({"type": "code", "lang": lang, "start": ls,
+                           "end": line_end(j) if j < n else len(text), "body": body})
+            i = j + 1 if j < n else n
+            continue
+        if lt.strip().startswith("|") and i + 1 < n and _is_table_sep(lines[i + 1][0]):
+            header = _split_table_row(lt, ls)
+            aligns = _parse_aligns(lines[i + 1][0])
+            j, rows = i + 2, []
+            while j < n and lines[j][0].strip().startswith("|"):
+                rows.append(_split_table_row(lines[j][0], lines[j][1]))
+                j += 1
+            blocks.append({"type": "table", "header": header, "align": aligns,
+                           "rows": rows, "start": ls, "end": line_end(j - 1)})
+            i = j
+            continue
+        if _is_hr(lt):
+            blocks.append({"type": "hr", "start": ls, "end": line_end(i)})
+            i += 1
+            continue
+        if _is_list_item(lt):
+            items = []
+            while i < n:
+                lt2, ls2 = lines[i]
+                m = re.match(r"^(\s*)([-*+]|\d+[.)])\s+(.*)$", lt2)
+                if m:
+                    items.append({"marker": m.group(2), "depth": len(m.group(1)) // 2,
+                                  "lines": [(m.group(3), ls2 + m.start(3))]})
+                    i += 1
+                    continue
+                cm = re.match(r"^(\s{2,})(\S.*)$", lt2)
+                if cm and items:
+                    items[-1]["lines"].append((cm.group(2), ls2 + len(cm.group(1))))
+                    i += 1
+                    continue
+                break
+            blocks.append({"type": "list", "items": items, "start": ls,
+                           "end": line_end(i - 1) if i > 0 else ls})
+            continue
+        if lt.startswith(">"):
+            qlines = []
+            while i < n and lines[i][0].startswith(">"):
+                qt, qs = lines[i]
+                depth, k = 0, 0
+                while k < len(qt) and qt[k] == ">":
+                    depth += 1
+                    k += 1
+                if k < len(qt) and qt[k] == " ":
+                    k += 1
+                qlines.append((qt[k:], qs + k, depth))
+                i += 1
+            blocks.append({"type": "quote", "lines": qlines, "depth": qlines[0][2],
+                           "start": ls, "end": line_end(i - 1)})
+            continue
+        plines = []
+        while i < n:
+            lt2, ls2 = lines[i]
+            if not lt2.strip() or is_block_start(lt2, lines[i + 1][0] if i + 1 < n else None):
+                break
+            plines.append((lt2, ls2))
+            i += 1
+        blocks.append({"type": "para", "lines": plines, "start": ls,
+                       "end": line_end(i - 1) if i > 0 else ls})
+    return blocks
+
+def _render_heading(blk, base, font, max_w, line_spacing, line_h):
+    level = blk["level"]
+    pieces = parse_inline(blk["content"], base + blk["content_start"])
+    hf = _md_heading_font(font, level)
+    hfm = QFontMetricsF(hf)
+    hh = hfm.height() * line_spacing * (1.15 if level <= 2 else 1.0)
+    asc = hfm.ascent()
+    wrapped = _wrap_pieces(pieces, max_w, hf)
+    lines = [_line_from_pieces(w, (w[0][2] if w else base + blk["content_start"]),
+                               (w[-1][3] if w else base + blk["content_start"]),
+                               style="h%d" % level, height=hh, ascent=asc, indent=0.0)
+             for w in wrapped]
+    if lines:
+        lines[-1].gap_after = MD_H_GAP.get(level, 0.4) * line_h
+    return lines
+
+def _render_para(blk, base, font, max_w, line_spacing, line_h, para_gap):
+    pieces = _pieces_from_lines(blk["lines"], base)
+    fm = QFontMetricsF(font)
+    asc = fm.ascent()
+    wrapped = _wrap_pieces(pieces, max_w, font)
+    lines = [_line_from_pieces(w, (w[0][2] if w else base + blk["start"]),
+                               (w[-1][3] if w else base + blk["start"]),
+                               indent=0.0, height=line_h, ascent=asc)
+             for w in wrapped]
+    if lines:
+        lines[-1].gap_after = para_gap
+    return lines
+
+def _render_quote(blk, base, font, max_w, line_spacing, line_h, para_gap):
+    indent = MD_QUOTE_INDENT * blk["depth"]
+    plines = [(t, s) for (t, s, _d) in blk["lines"]]
+    pieces = _pieces_from_lines(plines, base)
+    fm = QFontMetricsF(font)
+    asc = fm.ascent()
+    wrapped = _wrap_pieces(pieces, max_w - indent, font)
+    lines = [_line_from_pieces(w, (w[0][2] if w else base + blk["start"]),
+                               (w[-1][3] if w else base + blk["start"]),
+                               indent=indent, height=line_h, ascent=asc, style="quote")
+             for w in wrapped]
+    if lines:
+        lines[-1].gap_after = para_gap
+    return lines
+
+def _render_list(blk, base, font, max_w, line_spacing, line_h, para_gap):
+    fm = QFontMetricsF(font)
+    asc = fm.ascent()
+    lines = []
+    for item in blk["items"]:
+        marker = item["marker"]
+        content_indent = item["depth"] * MD_LIST_INDENT + fm.horizontalAdvance(marker) + 8.0
+        pieces = _pieces_from_lines(item["lines"], base)
+        wrapped = _wrap_pieces(pieces, max_w - content_indent, font)
+        before = len(lines)
+        for k, w in enumerate(wrapped):
+            lines.append(_line_from_pieces(
+                w, (w[0][2] if w else base + item["lines"][0][1]),
+                (w[-1][3] if w else base + item["lines"][0][1]),
+                indent=content_indent, marker=(marker if k == 0 else None),
+                height=line_h, ascent=asc))
+        if len(lines) > before:
+            lines[-1].gap_after = para_gap * 0.4
+    if lines:
+        lines[-1].gap_after = para_gap
+    return lines
+
+def _render_code(blk, base, font, max_w, line_spacing, line_h, para_gap):
+    cf = _md_mono_font(font)
+    cfm = QFontMetricsF(cf)
+    asc = cfm.ascent()
+    hh = cfm.height() * line_spacing
+    lines = []
+    for (t, s) in blk["body"]:
+        if t == "":
+            lines.append(Line("", base + s, base + s, indent=0.0, style="code",
+                              height=hh, ascent=asc))
+            continue
+        wrapped = _wrap_pieces([(t, MD_CODE, base + s, base + s + len(t))], max_w, font)
+        for w in wrapped:
+            lines.append(_line_from_pieces(w, base + s, base + s + len(t),
+                                           indent=0.0, style="code", height=hh, ascent=asc))
+    if not lines:
+        lines.append(Line("", base + blk["start"], base + blk["end"], indent=0.0,
+                          style="code", height=hh, ascent=asc))
+    lines[-1].gap_after = para_gap
+    return lines
+
+def _shrink_widths(widths, avail, min_w):
+    ws = list(widths)
+    for _ in range(24):
+        total = sum(ws)
+        if total <= avail:
+            break
+        shrinkable = [(i, ws[i] - min_w) for i in range(len(ws)) if ws[i] > min_w]
+        cap = sum(x for _, x in shrinkable)
+        if cap <= 0:
+            break
+        take = min(total - avail, cap)
+        for i, room in shrinkable:
+            ws[i] -= take * (room / cap)
+    return ws
+
+def _render_table(blk, base, font, max_w, line_spacing, line_h, para_gap):
+    fm = QFontMetricsF(font)
+    asc = fm.ascent()
+    space_w = max(1.0, fm.horizontalAdvance(" "))
+    sep = fm.horizontalAdvance("  ")
+
+    def prep(cells):
+        out = []
+        for (t, s) in cells:
+            pieces = parse_inline(t, base + s)
+            out.append(("".join(p[0] for p in pieces), pieces, s))
+        return out
+
+    hprep = prep(blk["header"])
+    rprep = [prep(r) for r in blk["rows"]]
+    ncol = max([len(hprep)] + [len(r) for r in rprep] + [len(blk["align"])])
+    aligns = (blk["align"] + ["left"] * ncol)[:ncol]
+    widths = [0.0] * ncol
+    for row in [hprep] + rprep:
+        for j, (disp, _p, _s) in enumerate(row):
+            widths[j] = max(widths[j], fm.horizontalAdvance(disp))
+    # 超出页宽则收缩列宽（不窄于两个汉字），单元格自动换行
+    avail = max_w - sep * max(0, ncol - 1)
+    min_w = fm.horizontalAdvance("中") * 2.0
+    if avail > 0 and sum(widths) > avail:
+        widths = _shrink_widths(widths, avail, min_w)
+
+    def row_lines(prep_row, bold):
+        wrapped = []
+        for j in range(ncol):
+            _disp, pp, _s = prep_row[j] if j < len(prep_row) else ("", [], 0)
+            wrapped.append(_wrap_pieces(pp, max(widths[j], 1.0), font) if pp else [[]])
+        nlines = max(len(c) for c in wrapped)
+        out, row_s0, row_s1 = [], None, None
+        for k in range(nlines):
+            pieces = []
+            for j in range(ncol):
+                cl = wrapped[j]
+                wl = cl[k] if k < len(cl) else []
+                disp = "".join(p[0] for p in wl)
+                tw = fm.horizontalAdvance(disp)
+                w = widths[j]
+                a = aligns[j]
+                left = (w - tw) if a == "right" else ((w - tw) / 2 if a == "center" else 0.0)
+                left = max(0.0, left)
+                right = max(0.0, w - tw - left)
+                _d, _pp, s = prep_row[j] if j < len(prep_row) else ("", [], 0)
+                cs = wl[0][2] if wl else base + s
+                ce = wl[-1][3] if wl else base + s
+                if wl:
+                    if row_s0 is None:
+                        row_s0 = cs
+                    row_s1 = ce
+                if left > 0:
+                    pieces.append((" " * max(1, int(round(left / space_w))), 0, cs, cs))
+                for (dt, bits, ss0, ss1) in wl:
+                    pieces.append((dt, (bits | MD_BOLD) if bold else bits, ss0, ss1))
+                if right > 0:
+                    pieces.append((" " * max(1, int(round(right / space_w))), 0, ce, ce))
+                if j < ncol - 1:
+                    pieces.append(("  ", 0, ce, ce))
+            out.append(_line_from_pieces(pieces,
+                                         row_s0 if row_s0 is not None else base + blk["start"],
+                                         row_s1 if row_s1 is not None else base + blk["start"],
+                                         indent=0.0, height=line_h, ascent=asc))
+        return out
+
+    lines = row_lines(hprep, bold=True)
+    lines.append(Line("", base + blk["start"], base + blk["end"], indent=0.0,
+                      style="hr", height=line_h * 0.5, ascent=asc))
+    for r in rprep:
+        lines.extend(row_lines(r, bold=False))
+    lines[-1].gap_after = para_gap
+    return lines
+
+def render_md_lines(text, base_offset, font, max_w, line_spacing, para_spacing, line_h):
+    """把一段 markdown 文本渲染成带样式与源偏移映射的 Line 列表（绝对偏移）。"""
+    fm = QFontMetricsF(font)
+    para_gap = fm.height() * para_spacing
+    out = []
+    for blk in _md_blocks(text):
+        t = blk["type"]
+        if t == "heading":
+            out.extend(_render_heading(blk, base_offset, font, max_w, line_spacing, line_h))
+        elif t == "code":
+            out.extend(_render_code(blk, base_offset, font, max_w, line_spacing, line_h, para_gap))
+        elif t == "table":
+            out.extend(_render_table(blk, base_offset, font, max_w, line_spacing, line_h, para_gap))
+        elif t == "list":
+            out.extend(_render_list(blk, base_offset, font, max_w, line_spacing, line_h, para_gap))
+        elif t == "quote":
+            out.extend(_render_quote(blk, base_offset, font, max_w, line_spacing, line_h, para_gap))
+        elif t == "hr":
+            out.append(Line("", base_offset + blk["start"], base_offset + blk["end"],
+                            indent=0.0, style="hr", height=line_h * 0.5,
+                            ascent=fm.ascent(), gap_after=para_gap))
+        elif t == "para":
+            out.extend(_render_para(blk, base_offset, font, max_w, line_spacing, line_h, para_gap))
+    return out
+
+def _pack_lines(lines, usable_h, default_line_h):
+    pages, cur, cur_h = [], [], 0.0
+    for ln in lines:
+        lh = ln.height if ln.height else default_line_h
+        if cur and cur_h + lh > usable_h:
+            pages.append(Page(len(pages), cur[0].start, cur[-1].end, cur))
+            cur, cur_h = [], 0.0
+        cur.append(ln)
+        cur_h += lh + ln.gap_after
+    if cur:
+        pages.append(Page(len(pages), cur[0].start, cur[-1].end, cur))
+    elif not pages:
+        pages.append(Page(0, 0, 0, []))
+    return pages
+
 # ============ 章节扫描（一次 C 级正则扫描） ============
 CHAPTER_RE = re.compile(
     r"^\s*(?:第[零一二三四五六七八九十百千万0-9]{1,10}[章节回卷集部篇][^\n]{0,40}|"
@@ -115,7 +721,10 @@ CHAPTER_RE = re.compile(
     re.MULTILINE)
 
 def scan_chapters(text: str) -> List[Tuple[int, str]]:
-    chapters = [(m.start(), m.group(0).strip()) for m in CHAPTER_RE.finditer(text)]
+    chapters = []
+    for m in CHAPTER_RE.finditer(text):
+        title = re.sub(r"^#{1,6}[ \t]+", "", m.group(0).strip())
+        chapters.append((m.start(), title))
     if not chapters:
         # 无任何章节 → 按块切成伪章节，保证惰性分页可用
         chapters = [(i, f"第 {i // CHUNK + 1} 部分") for i in range(0, len(text), CHUNK)]
@@ -131,8 +740,9 @@ class _Chapter:
 
 class LazyPager:
     """按章节惰性分页，只缓存最近几章，其余按需计算。"""
-    def __init__(self, text: str, chapters: List[Tuple[int, str]]):
+    def __init__(self, text: str, chapters: List[Tuple[int, str]], md: bool = False):
         self.text = text
+        self.md = md
         self._params = {"font": QFont(), "page_size": QSizeF(400, 500),
                         "line_spacing": LINE_SPACING, "margin_x": MARGIN_X,
                         "margin_y": MARGIN_Y, "para_spacing": PARA_SPACING}
@@ -163,10 +773,18 @@ class LazyPager:
         if pages is None:
             c = self.chapters[ci]
             p = self._params
-            pages = paginate(self.text[c.start:c.end], p["font"], p["page_size"],
-                             base_offset=c.start, line_spacing=p["line_spacing"],
-                             margin_x=p["margin_x"], margin_y=p["margin_y"],
-                             para_spacing=p.get("para_spacing", PARA_SPACING))
+            if self.md:
+                max_w = p["page_size"].width() - 2 * p["margin_x"]
+                line_h = QFontMetricsF(p["font"]).height() * p["line_spacing"]
+                lines = render_md_lines(self.text[c.start:c.end], c.start, p["font"],
+                                        max_w, p["line_spacing"],
+                                        p.get("para_spacing", PARA_SPACING), line_h)
+                pages = _pack_lines(lines, p["page_size"].height() - 2 * p["margin_y"], line_h)
+            else:
+                pages = paginate(self.text[c.start:c.end], p["font"], p["page_size"],
+                                 base_offset=c.start, line_spacing=p["line_spacing"],
+                                 margin_x=p["margin_x"], margin_y=p["margin_y"],
+                                 para_spacing=p.get("para_spacing", PARA_SPACING))
             self._cache[ci] = pages
             # 淘汰最远的章节，保留当前章节及其邻居（跨章翻页无感）
             if len(self._cache) > MAX_CACHE:
@@ -831,6 +1449,63 @@ class PageView(QWidget):
         p.setBrush(QBrush(g))
         p.drawRect(QRectF(x0, left.top(), x1 - x0, left.height()))
 
+    def _line_font(self, ln):
+        if ln.style:
+            if ln.style.startswith("h") and ln.style[1:].isdigit():
+                return _md_heading_font(self.font, int(ln.style[1:]))
+            if ln.style == "code":
+                return _md_mono_font(self.font)
+        return self.font
+
+    def _draw_highlights(self, p, ln, line_x, y, lh, lfm):
+        def dpos(src):
+            return lfm.horizontalAdvance(ln.text[:_line_src_to_disp(ln, src)])
+        rs, re_ = max(ln.start, self.read_start), min(ln.end, self.read_end)
+        if rs < re_:
+            p.fillRect(QRectF(line_x + dpos(rs), y, dpos(re_) - dpos(rs), lh), QColor("#ffe08a"))
+        if self.search_starts and self.search_len > 0:
+            lo = bisect.bisect_left(self.search_starts, ln.start)
+            hi = bisect.bisect_left(self.search_starts, ln.end)
+            for k in range(lo, hi):
+                ms = self.search_starts[k]
+                me = min(ms + self.search_len, ln.end)
+                col = QColor("#ffb340") if ms == self.search_cur else QColor("#ffe9a8")
+                p.fillRect(QRectF(line_x + dpos(ms), y, dpos(me) - dpos(ms), lh), col)
+        s, e = max(ln.start, self.sel_start), min(ln.end, self.sel_end)
+        if s < e:
+            p.fillRect(QRectF(line_x + dpos(s), y, dpos(e) - dpos(s), lh), QColor("#cfe3ff"))
+
+    def _draw_runs(self, p, ln, lfont, line_x, y, asc):
+        base = QColor(MD_QUOTE_COLOR) if ln.style == "quote" else QColor(self.text_color)
+        x = line_x
+        for (d0, dl, bits) in ln.runs:
+            seg = ln.text[d0:d0 + dl]
+            if not seg:
+                continue
+            f = _md_style_font(lfont, bits)
+            p.setFont(f)
+            fmm = QFontMetricsF(f)
+            w = fmm.horizontalAdvance(seg)
+            if bits & MD_CODE:
+                p.fillRect(QRectF(x, y, w, fmm.height()), QColor(MD_INLINE_CODE_BG))
+            if bits & MD_LINK:
+                col = QColor(MD_LINK_COLOR)
+            elif bits & MD_CODE:
+                col = QColor(MD_INLINE_CODE_COLOR)
+            else:
+                col = base
+            p.setPen(col)
+            p.drawText(QPointF(x, y + asc), seg)
+            if bits & MD_STRIKE:
+                p.setPen(QPen(base, 1))
+                p.drawLine(QPointF(x, y + asc - fmm.ascent() / 2),
+                           QPointF(x + w, y + asc - fmm.ascent() / 2))
+            if bits & MD_LINK:
+                p.setPen(QPen(QColor(MD_LINK_COLOR), 1))
+                p.drawLine(QPointF(x, y + asc + fmm.descent() * 0.4),
+                           QPointF(x + w, y + asc + fmm.descent() * 0.4))
+            x += w
+
     def _draw_page(self, p, rect, page, header_text):
         # 四周轻微投影，模拟书页浮在深色桌面上
         for i in (6, 4, 2):
@@ -843,37 +1518,41 @@ class PageView(QWidget):
         p.drawRect(rect)
 
         fm = QFontMetricsF(self.font)
-        p.setFont(self.font); p.setPen(QColor(self.text_color))
-        indent_w = fm.horizontalAdvance("中") * INDENT_SPACES
+        base_asc = fm.ascent()
         tx = rect.left() + self.margin_x
+        max_w = rect.width() - 2 * self.margin_x
         y = rect.top() + self.margin_y          # 每行的“顶端”
         for ln in page.lines:
+            lh = ln.height if ln.height else self.line_h
+            asc = ln.ascent if ln.ascent else base_asc
+            lfont = self._line_font(ln)
+            lfm = fm if lfont is self.font else QFontMetricsF(lfont)
+            ix = ln.indent if ln.indent else 0.0
+            line_x = tx + ix
+            # 块级装饰：代码块底色 / 引用竖线 / 分隔线
+            if ln.style == "code":
+                p.fillRect(QRectF(tx - 6, y, max_w + 12, lh), QColor(MD_CODE_BG))
+            if ln.style == "quote":
+                p.fillRect(QRectF(tx + ix - MD_BAR_W - 6, y, MD_BAR_W, lh), QColor(MD_BAR_COLOR))
+            if ln.style == "hr":
+                p.setPen(QPen(QColor(MD_HR_COLOR), 1))
+                p.drawLine(QPointF(tx, y + lh / 2), QPointF(tx + max_w, y + lh / 2))
+            # 高亮（朗读 / 搜索 / 选择）：源偏移 → 显示位置
+            self._draw_highlights(p, ln, line_x, y, lh, lfm)
+            # 列表标记
+            if ln.marker:
+                p.setFont(lfont)
+                p.setPen(QColor(self.text_color))
+                p.drawText(QPointF(line_x - lfm.horizontalAdvance(ln.marker) - 8.0, y + asc), ln.marker)
+            # 正文
             if ln.text:
-                ix = indent_w if ln.indent else 0.0
-                line_x = tx + ix
-                rs, re_ = max(ln.start, self.read_start), min(ln.end, self.read_end)
-                if rs < re_:
-                    x1 = line_x + fm.horizontalAdvance(ln.text[:rs - ln.start])
-                    x2 = line_x + fm.horizontalAdvance(ln.text[:re_ - ln.start])
-                    p.fillRect(QRectF(x1, y, x2 - x1, fm.height()), QColor("#ffe08a"))
-                # 搜索高亮：当前匹配亮橙，其余淡黄
-                if self.search_starts and self.search_len > 0:
-                    lo = bisect.bisect_left(self.search_starts, ln.start)
-                    hi = bisect.bisect_left(self.search_starts, ln.end)
-                    for k in range(lo, hi):
-                        ms = self.search_starts[k]
-                        me = min(ms + self.search_len, ln.end)
-                        x1 = line_x + fm.horizontalAdvance(ln.text[:ms - ln.start])
-                        x2 = line_x + fm.horizontalAdvance(ln.text[:me - ln.start])
-                        col = QColor("#ffb340") if ms == self.search_cur else QColor("#ffe9a8")
-                        p.fillRect(QRectF(x1, y, x2 - x1, fm.height()), col)
-                s, e = max(ln.start, self.sel_start), min(ln.end, self.sel_end)
-                if s < e:
-                    x1 = line_x + fm.horizontalAdvance(ln.text[:s - ln.start])
-                    x2 = line_x + fm.horizontalAdvance(ln.text[:e - ln.start])
-                    p.fillRect(QRectF(x1, y, x2 - x1, fm.height()), QColor("#cfe3ff"))
-                p.drawText(QPointF(line_x, y + fm.ascent()), ln.text)
-            y += self.line_h + ln.gap_after
+                if ln.runs:
+                    self._draw_runs(p, ln, lfont, line_x, y, asc)
+                else:
+                    p.setFont(lfont)
+                    p.setPen(QColor(MD_QUOTE_COLOR) if ln.style == "quote" else QColor(self.text_color))
+                    p.drawText(QPointF(line_x, y + asc), ln.text)
+            y += lh + ln.gap_after
 
         # 页眉（顶部居中，左侧书名 / 右侧章节），与正文留出清晰间距
         if header_text:
@@ -898,18 +1577,18 @@ class PageView(QWidget):
         for rect, pi in ((left, self.spread * 2), (right, self.spread * 2 + 1)):
             if pi < len(self.pages) and rect.contains(pos):
                 page = self.pages[pi]
-                fm = QFontMetricsF(self.font)
                 y = rect.top() + self.margin_y
                 ln = page.lines[-1] if page.lines else None
                 for cand in page.lines:                 # 按累计高度定位行
-                    h = self.line_h + cand.gap_after
+                    h = (cand.height if cand.height else self.line_h) + cand.gap_after
                     if pos.y() < y + h:
                         ln = cand
                         break
                     y += h
                 if ln is None:
                     return None
-                ix = (fm.horizontalAdvance("中") * INDENT_SPACES) if ln.indent else 0.0
+                fm = QFontMetricsF(self._line_font(ln))
+                ix = ln.indent if ln.indent else 0.0
                 x = pos.x() - (rect.left() + self.margin_x + ix)
                 lo, hi = 0, len(ln.text)
                 while lo < hi:
@@ -918,7 +1597,7 @@ class PageView(QWidget):
                         lo = mid
                     else:
                         hi = mid - 1
-                return ln.start + lo
+                return _line_disp_to_src(ln, lo)
         return None
 
     def mousePressEvent(self, e):
@@ -1344,7 +2023,10 @@ class MainWindow(QMainWindow):
         self.load_bar.hide()
         self.full_text = text
         self.view.set_layout(self._make_layout())
-        self.pager = LazyPager(text, chapters)
+        is_md = os.path.splitext(self.book_path)[1].lower() == ".md"
+        if is_md:
+            chapters = md_chapters(text)
+        self.pager = LazyPager(text, chapters, md=is_md)
         self.pager.set_params(self.view.pagination_params())
         self.view.full_text = text
         self.view.book_title = title or os.path.splitext(os.path.basename(self.book_path))[0]
@@ -1411,8 +2093,15 @@ class MainWindow(QMainWindow):
     # ---- 目录 / 书签 ----
     def _build_toc(self):
         self.toc.clear()
-        for off, title in [(c.start, c.title) for c in self.pager.chapters]:
-            it = QListWidgetItem(title)
+        if self.pager and self.pager.md:
+            items = [(m.start(), m.group(2).strip(), len(m.group(1)))
+                     for m in MD_HEAD_RE.finditer(self.full_text)]
+            if not items:
+                items = [(c.start, c.title, 1) for c in self.pager.chapters]
+        else:
+            items = [(c.start, c.title, 1) for c in self.pager.chapters]
+        for off, title, level in items:
+            it = QListWidgetItem("      " * (level - 1) + title)
             it.setData(Qt.ItemDataRole.UserRole, off)
             self.toc.addItem(it)
 
