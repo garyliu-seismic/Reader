@@ -5,8 +5,10 @@ import json
 # ---- 数据存储路径 ----
 APP_DIR = os.path.join(os.path.expanduser("~"), ".pyreader")
 os.makedirs(APP_DIR, exist_ok=True)
-CONFIG_PATH = os.path.join(APP_DIR, "config.json")
+CONFIG_PATH    = os.path.join(APP_DIR, "config.json")
 BOOKMARKS_PATH = os.path.join(APP_DIR, "bookmarks.json")
+CACHE_DIR      = os.path.join(APP_DIR, "cache")
+os.makedirs(CACHE_DIR, exist_ok=True)
 
 # ---- 排版常量 ----
 OUTER = 16.0            # 页面距窗口边距
@@ -59,6 +61,10 @@ THEMES = {
 }
 DEFAULT_THEME = "夜间（默认）"
 
+# 翻页方式
+FLIP_EFFECTS = ["3D 翻书", "平移滑动", "直接切换"]
+DEFAULT_FLIP_EFFECT = "3D 翻书"
+
 DEFAULT_CONFIG = {"font_family": "", "font_size": 15,
                   "line_spacing": 1.5, "margin_x": 28.0, "margin_y": 44.0,
                   "outer": 16.0, "gutter": 36.0, "para_spacing": 0.6,
@@ -66,7 +72,8 @@ DEFAULT_CONFIG = {"font_family": "", "font_size": 15,
                   "model": "gpt-4o-mini",
                   "tts_voice": "zh-CN-XiaoxiaoNeural", "tts_rate": "+0%",
                   "theme": DEFAULT_THEME, "recent": [],
-                  "bilingual": False, "bilingual_target": "中文"}
+                  "bilingual": False, "bilingual_target": "中文",
+                  "flip_effect": DEFAULT_FLIP_EFFECT}
 
 
 def default_cjk_font() -> str:
