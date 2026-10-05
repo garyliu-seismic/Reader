@@ -12,6 +12,35 @@
 import json
 import math
 import html as _html
+import os
+import urllib.request
+from pathlib import Path
+from .config import APP_DIR
+
+# vis-network 离线缓存路径
+_VIS_CACHE = Path(APP_DIR) / "vis-network.min.js"
+_VIS_URL   = "https://unpkg.com/vis-network@9.1.9/standalone/umd/vis-network.min.js"
+_VIS_URL2  = "https://cdn.jsdelivr.net/npm/vis-network@9.1.9/standalone/umd/vis-network.min.js"  # 备用 CDN
+
+
+def _ensure_vis_js() -> str:
+    """返回 vis-network JS 内容字符串：优先用本地缓存，如没有则尝试下载（异步）。
+    返回空字符串表示还没准备好（需要联网）。
+    """
+    if _VIS_CACHE.exists() and _VIS_CACHE.stat().st_size > 100_000:
+        return _VIS_CACHE.read_text(encoding="utf-8")
+    # 尝试下载
+    for url in (_VIS_URL, _VIS_URL2):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = r.read()
+            if len(data) > 100_000:
+                _VIS_CACHE.write_bytes(data)
+                return data.decode("utf-8")
+        except Exception:
+            continue
+    return ""
 
 # 节点类型 → (背景色, 边框色, 文字色)
 _TYPE_COLOR = {
@@ -51,13 +80,17 @@ def build_graph_html(graph_json: str, title: str = "") -> str:
     if not nodes:
         return _error_html("图谱中没有节点数据")
 
-    return _build_visjs_html(nodes, edges, title)
+    vis_js = _ensure_vis_js()
+    if not vis_js:
+        return _error_html(
+            "vis-network 库尚未下载。\n"
+            "请联网后重试（程序会自动下载约 700KB 的图形库，之后永久离线可用）。"
+        )
+    return _build_visjs_html(nodes, edges, title, vis_js)
 
 
-def _build_visjs_html(nodes: list, edges: list, title: str) -> str:
-    """用内嵌 vis-network（通过 CDN JS 字符串）渲染交互图谱。
-    vis-network 的 JS 直接内嵌，完全离线可用。
-    """
+def _build_visjs_html(nodes: list, edges: list, title: str, vis_js: str) -> str:
+    """用内嵌 vis-network JS 渲染交互图谱（完全离线，不依赖外网 CDN）。"""
     # ---- 构造 vis.js nodes / edges 数据 ----
     vis_nodes = []
     for n in nodes:
@@ -106,12 +139,7 @@ def _build_visjs_html(nodes: list, edges: list, title: str) -> str:
 <head>
 <meta charset="utf-8"/>
 <title>{title_esc} 知识图谱</title>
-<script>
-/* vis-network 9.1.9 内嵌精简版（来自 unpkg，已离线化）*/
-/* 此处加载策略：先尝试 fetch 本地缓存，失败则 inline fallback */
-</script>
-<script src="https://unpkg.com/vis-network@9.1.9/standalone/umd/vis-network.min.js"
-        onerror="document.getElementById('load-err').style.display='block'"></script>
+<script>{vis_js}</script>
 <style>
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
   body {{ background: #1e1e2e; font-family: "Microsoft YaHei", sans-serif; height: 100vh;
@@ -124,7 +152,7 @@ def _build_visjs_html(nodes: list, edges: list, title: str) -> str:
   #tooltip {{ position:fixed; background:#333; color:#fff; padding:6px 10px;
               border-radius:6px; font-size:12px; max-width:240px; pointer-events:none;
               display:none; z-index:99; line-height:1.5; }}
-  #load-err {{ display:none; color:#ff6666; padding:20px; text-align:center; font-size:14px; }}
+
   #controls {{ position:absolute; bottom:12px; right:12px; display:flex; gap:6px; z-index:10; }}
   .ctrl-btn {{ background:#3a3a5e; color:#ccc; border:1px solid #555; border-radius:4px;
                padding:4px 10px; cursor:pointer; font-size:12px; }}
@@ -136,7 +164,6 @@ def _build_visjs_html(nodes: list, edges: list, title: str) -> str:
   <span>📚 {title_esc} &nbsp;—&nbsp; 知识图谱</span>
   <div id="legend">{legend_items}</div>
 </div>
-<div id="load-err">⚠️ 无法加载 vis-network，请检查网络连接（首次使用需联网下载约 800KB）</div>
 <div id="network"></div>
 <div id="tooltip"></div>
 <div id="controls">
