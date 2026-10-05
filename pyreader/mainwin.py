@@ -650,7 +650,11 @@ class MainWindow(QMainWindow):
 
         def _on_done(graph_json: str):
             html = build_graph_html(graph_json, title)
-            self.graph_view.setHtml(html, QUrl("about:blank"))
+            import tempfile, os as _os
+            _tmp = _os.path.join(tempfile.gettempdir(), "pyreader_graph.html")
+            with open(_tmp, "w", encoding="utf-8") as _f:
+                _f.write(html)
+            self.graph_view.load(QUrl.fromLocalFile(_tmp))
             self.statusBar().showMessage(f"🕸️ 知识图谱已生成：《{title}》")
 
         def _on_fail(msg: str):
