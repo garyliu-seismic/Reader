@@ -142,18 +142,20 @@ def _build_visjs_html(nodes: list, edges: list, title: str, vis_js: str) -> str:
 <script>{vis_js}</script>
 <style>
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{ background: #1e1e2e; font-family: "Microsoft YaHei", sans-serif; height: 100vh;
-          display: flex; flex-direction: column; overflow: hidden; }}
-  #titlebar {{ padding: 6px 12px; background: #2a2a3e; color: #e0e0ff;
-               font-size: 13px; border-bottom: 1px solid #444; flex-shrink:0;
-               display:flex; justify-content:space-between; align-items:center; }}
+  html, body {{ width: 100%; height: 100%; background: #1e1e2e;
+                font-family: "Microsoft YaHei", sans-serif; overflow: hidden; }}
+  #titlebar {{ position: absolute; top: 0; left: 0; right: 0; height: 32px;
+               padding: 0 12px; background: #2a2a3e; color: #e0e0ff;
+               font-size: 13px; border-bottom: 1px solid #444;
+               display:flex; justify-content:space-between; align-items:center;
+               z-index: 5; }}
   #legend {{ display:flex; flex-wrap:wrap; gap:4px; }}
-  #network {{ flex: 1; }}
+  #network {{ position: absolute; top: 32px; left: 0; right: 0; bottom: 0; }}
   #tooltip {{ position:fixed; background:#333; color:#fff; padding:6px 10px;
               border-radius:6px; font-size:12px; max-width:240px; pointer-events:none;
               display:none; z-index:99; line-height:1.5; }}
 
-  #controls {{ position:absolute; bottom:12px; right:12px; display:flex; gap:6px; z-index:10; }}
+  #controls {{ position:fixed; bottom:12px; right:12px; display:flex; gap:6px; z-index:10; }}
   .ctrl-btn {{ background:#3a3a5e; color:#ccc; border:1px solid #555; border-radius:4px;
                padding:4px 10px; cursor:pointer; font-size:12px; }}
   .ctrl-btn:hover {{ background:#5050aa; color:#fff; }}
@@ -173,6 +175,11 @@ def _build_visjs_html(nodes: list, edges: list, title: str, vis_js: str) -> str:
 </div>
 
 <script>
+// 压制 vis-network 物理引擎稳定化期间的 ResizeObserver 噪音
+const _OrigRO = window.ResizeObserver;
+window.ResizeObserver = class extends _OrigRO {{
+  constructor(cb) {{ super((entries, obs) => {{ try {{ cb(entries, obs); }} catch(e) {{}} }}); }}
+}};
 var physicsOn = true;
 var nodes = new vis.DataSet({nodes_js});
 var edges = new vis.DataSet({edges_js});
