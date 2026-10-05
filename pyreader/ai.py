@@ -7,22 +7,58 @@ from PySide6.QtCore import QObject, Signal
 _SHORT_TIMEOUT = 30
 _LONG_TIMEOUT  = 90
 
+def _build_chat_url(base: str, api_version: str) -> str:
+    """构造 chat/completions URL，Azure 旧式部署路径自动附加 api-version。
+
+    支持两种 Azure 路径形式：
+      新式 v1（推荐）: .../openai/v1          → 直接拼 /chat/completions
+      旧式部署路径:    .../openai/deployments/xxx → 附加 ?api-version=...
+    其余（OpenAI / DeepSeek / Ollama 等）不做处理。
+    """
+    url = base + "/chat/completions"
+    # 旧式 Azure 部署路径：包含 /deployments/ 且不含 /v1
+    if "/deployments/" in base and "/v1" not in base:
+        ver = (api_version or "2024-10-21").strip()
+        url += f"?api-version={ver}"
+    return url
+
+
 def call_llm(prompt, cfg, timeout=_SHORT_TIMEOUT, messages=None):
     """单轮或多轮调用。
     messages: 若传入则作为完整 messages 列表（多轮对话），忽略 prompt。
+
+    Azure AI Foundry 两种用法：
+      1. 新式 v1（推荐）
+         api_base  = https://<resource>.openai.azure.com/openai/v1
+         model     = <Deployment Name>（如 gpt-4o-mini）
+         api_key   = <Azure API Key>
+         无需填 api_version
+      2. 旧式部署路径
+         api_base  = https://<resource>.openai.azure.com/openai/deployments/<deployment>
+         api_version = 2024-10-21（或其他版本）
+         model 可留空（路径已含部署名）
     """
     key = (cfg.get("api_key") or "").strip()
     if not key:
         raise RuntimeError("未配置 API Key（工具栏→设置）")
     base = (cfg.get("api_base") or "https://api.openai.com/v1").strip().rstrip("/")
+    api_version = (cfg.get("api_version") or "").strip()
     msgs = messages if messages is not None else [{"role": "user", "content": prompt}]
-    payload = {"model": (cfg.get("model") or "").strip(),
-               "messages": msgs, "temperature": 0.2}
+    model_name = (cfg.get("model") or "").strip()
+    payload = {"model": model_name, "messages": msgs}
+    # temperature: gpt-5 系列会拒绝该参数，需略去。
+    # cfg["temperature"] == "none" （来自 .env CODING_AGENT_TEMPERATURE=none）或
+    # model 名含 "gpt-5" 时自动略去。
+    t = cfg.get("temperature", 0.2)
+    omit_temp = (str(t).lower() == "none") or ("gpt-5" in model_name.lower())
+    if not omit_temp:
+        payload["temperature"] = float(t) if t != "none" else 0.2
     host = urlparse(base).hostname or ""
     if host in ("localhost", "127.0.0.1"):
         payload["think"] = False
+    url = _build_chat_url(base, api_version)
     req = urllib.request.Request(
-        base + "/chat/completions",
+        url,
         data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json",
                  "Authorization": "Bearer " + key})

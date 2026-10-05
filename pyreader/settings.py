@@ -13,6 +13,8 @@ class SettingsDialog(QDialog):
         self.key = QLineEdit(cfg.get("api_key", "")); self.key.setEchoMode(QLineEdit.Password)
         self.base = QLineEdit(cfg.get("api_base", ""))
         self.model = QLineEdit(cfg.get("model", ""))
+        self.api_version = QLineEdit(cfg.get("api_version", ""))
+        self.api_version.setPlaceholderText("仅旧式 Azure 部署路径需要，如 2024-10-21")
         # 排版参数
         self.font_family = QComboBox()
         self.font_family.addItem("系统默认", "")
@@ -81,7 +83,8 @@ class SettingsDialog(QDialog):
         form.addRow("服务商预设", self.preset)
         form.addRow("API Key", self.key)
         form.addRow("API Base", self.base)
-        form.addRow("模型", self.model)
+        form.addRow("模型 / 部署名", self.model)
+        form.addRow("API Version", self.api_version)
         form.addRow("排版", QLabel("（调整后立即生效）"))
         form.addRow("字体", self.font_family)
         form.addRow("主题", self.theme)

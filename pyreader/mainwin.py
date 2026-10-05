@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QListWidget, QListWidgetIte
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtCore import QUrl
 from .config import (CONFIG_PATH, BOOKMARKS_PATH, OUTER, MARGIN_X, MARGIN_Y, GUTTER,
+                     load_env_defaults,
                      LINE_SPACING, PARA_SPACING, _HAS_MULTIMEDIA, QMediaPlayer, QAudioOutput,
                      load_json, save_json, default_cjk_font, THEMES, DEFAULT_THEME, DEFAULT_CONFIG,
                      FLIP_EFFECTS, DEFAULT_FLIP_EFFECT)
@@ -32,7 +33,10 @@ from .tts import TtsWorker, TranslateWorker, split_sentences, TTS_DEFAULT_VOICE,
 class MainWindow(QMainWindow):
     def __init__(self, book_path=None):
         super().__init__()
-        self.cfg = {**DEFAULT_CONFIG, **load_json(CONFIG_PATH, {})}
+        # 优先级：DEFAULT_CONFIG < coding-agent/.env < 用户已保存的 config.json
+        _saved = load_json(CONFIG_PATH, {})
+        _env   = load_env_defaults() if not _saved.get("api_key") else {}
+        self.cfg = {**DEFAULT_CONFIG, **_env, **_saved}
         self.bookmarks = load_json(BOOKMARKS_PATH, {})
         self.book_path = book_path
         self.full_text = ""
@@ -477,7 +481,8 @@ class MainWindow(QMainWindow):
         dlg = SettingsDialog(self.cfg, self)
         if dlg.exec():
             self.cfg.update({
-                "api_key": dlg.key.text().strip(), "api_base": dlg.base.text().strip(), "model": dlg.model.text().strip(),
+                "api_key": dlg.key.text().strip(), "api_base": dlg.base.text().strip(),
+                "model": dlg.model.text().strip(), "api_version": dlg.api_version.text().strip(),
                 "font_family": dlg.font_family.currentData(),
                 "font_size": dlg.font_size.value(), "line_spacing": dlg.line_spacing.value(),
                 "para_spacing": dlg.para_spacing.value(),
