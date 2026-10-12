@@ -74,6 +74,7 @@ DEFAULT_CONFIG = {"font_family": "", "font_size": 15,
                   "model": "gpt-4o-mini",
                   "api_version": "",
                   "tts_voice": "zh-CN-XiaoxiaoNeural", "tts_rate": "+0%",
+                  "azure_tts_key": "", "azure_tts_region": "",
                   "theme": DEFAULT_THEME, "recent": [],
                   "bilingual": False, "bilingual_target": "中文",
                   "flip_effect": DEFAULT_FLIP_EFFECT}

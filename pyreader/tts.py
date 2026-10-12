@@ -1,16 +1,23 @@
 import os
+import re
 import io
 import wave
 import time
 import threading
 import asyncio
 import urllib.request
+import urllib.error
 from PySide6.QtCore import QObject, Signal
-from .config import APP_DIR
+from .config import APP_DIR, CONFIG_PATH, load_json
 from .ai import translate_to
 
 # ============ 语音朗读（edge-tts） ============
 TTS_VOICES = [
+    # Azure 云端（免费 F0 层，音质与 edge-tts 同源；需在“设置”里填 Azure 语音 Key + 区域）
+    ("晓晓（Azure 云端·免费）", "azure:zh-CN-XiaoxiaoNeural"),
+    ("晓伊（Azure 云端·免费）", "azure:zh-CN-XiaoyiNeural"),
+    ("云希（Azure 云端·免费）", "azure:zh-CN-YunxiNeural"),
+    ("云扬（Azure 云端·免费）", "azure:zh-CN-YunyangNeural"),
     ("晓晓（女·温柔，默认）", "zh-CN-XiaoxiaoNeural"),
     ("晓伊（女·活泼）", "zh-CN-XiaoyiNeural"),
     ("晓墨（女·可爱）", "zh-CN-XiaomoNeural"),
@@ -33,6 +40,8 @@ TTS_VOICES = [
 ]
 TTS_RATES = ["-50%", "-25%", "-10%", "+0%", "+10%", "+25%", "+50%", "+100%"]
 TTS_DEFAULT_VOICE = "zh-CN-XiaoxiaoNeural"
+# Azure 免费额度用尽的错误标记（供主窗口识别并友好提示，而不是默默跳句）
+AZURE_QUOTA_EXCEEDED = "AZURE_QUOTA_EXCEEDED"
 
 # Piper 离线语音：voice id -> Hugging Face piper-voices 仓库里的路径前缀
 PIPER_VOICES = {
@@ -42,6 +51,7 @@ PIPER_VOICES = {
 PIPER_MODEL_BASE_URL = "https://hf-mirror.com/rhasspy/piper-voices/resolve/main"
 _piper_voice_cache = {}
 _piper_voice_cache_lock = threading.Lock()
+_piper_synth_lock = threading.Lock()  # espeak-ng 音素化非线程安全，串行合成
 
 def _piper_model_dir():
     d = os.path.join(APP_DIR, "piper_models")
@@ -103,9 +113,59 @@ def synthesize_tts_piper(text: str, voice_id: str, rate: str) -> bytes:
     voice = _load_piper_voice(voice_id)
     syn_config = SynthesisConfig(length_scale=_piper_rate_to_length_scale(rate))
     buf = io.BytesIO()
-    with wave.open(buf, "wb") as wav_file:
-        voice.synthesize_wav(text, wav_file, syn_config=syn_config)
+    with _piper_synth_lock:
+        with wave.open(buf, "wb") as wav_file:
+            voice.synthesize_wav(text, wav_file, syn_config=syn_config)
     return buf.getvalue()
+
+def fallback_piper_voice_id(text: str) -> str:
+    """按文本语言选择离线 Piper 音色，用于 edge-tts 云端失败时兜底。"""
+    if re.search(r"[\u4e00-\u9fff]", text):
+        return "zh_CN-huayan-medium"
+    return "en_US-lessac-medium"
+
+def _azure_credentials():
+    """读取 Azure 语音的 Key 与区域（在“设置”里填写）。"""
+    cfg = load_json(CONFIG_PATH, {})
+    return (cfg.get("azure_tts_key", "") or "").strip(), \
+           (cfg.get("azure_tts_region", "") or "").strip().lower()
+
+def synthesize_tts_azure(text: str, voice: str, rate: str) -> bytes:
+    """Azure 语音服务（免费 F0 层）合成，返回 mp3 字节。音色与 edge-tts 同源。"""
+    key, region = _azure_credentials()
+    if not key or not region:
+        raise RuntimeError("未配置 Azure 语音：请在“设置”里填写 Azure 语音 Key 与区域")
+    def esc(s):
+        return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                 .replace('"', "&quot;").replace("'", "&apos;"))
+    ssml = (f"<speak version='1.0' xml:lang='zh-CN'>"
+            f"<voice name='{voice}'>"
+            f"<prosody rate='{rate}'>"
+            f"{esc(text)}"
+            f"</prosody></voice></speak>")
+    url = f"https://{region}.tts.speech.microsoft.com/cognitiveservices/v1"
+    req = urllib.request.Request(url, data=ssml.encode("utf-8"), headers={
+        "Ocp-Apim-Subscription-Key": key,
+        "Content-Type": "application/ssml+xml",
+        "X-Microsoft-OutputFormat": "audio-24khz-48kbitrate-mono-mp3",
+        "User-Agent": "PyReader/1.0",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = resp.read()
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", "ignore")[:300]
+        except Exception:
+            pass
+        if e.code == 429:
+            raise RuntimeError(
+                f"{AZURE_QUOTA_EXCEEDED}: 本月 Azure 免费额度已用完或请求过于频繁（HTTP 429）") from e
+        raise RuntimeError(f"Azure 语音失败（HTTP {e.code}）：{body or e.reason}") from e
+    if not data:
+        raise RuntimeError("Azure 未返回音频")
+    return data
 
 def split_sentences(text: str, base: int = 0):
     """把文本切成句子：返回 [(起始偏移, 结束偏移, 句子文本)]，偏移为全局字符偏移。
@@ -169,8 +229,11 @@ def split_sentences(text: str, base: int = 0):
     return res
 
 def synthesize_tts(text: str, voice: str, rate: str) -> bytes:
-    """把一段文本合成音频字节。voice 以 "piper:" 开头走本地离线合成（wav），
-    否则走 edge-tts 云端合成（mp3，直连，带重试）。"""
+    """把一段文本合成音频字节。voice 前缀决定后端：
+    "azure:" → Azure 语音（免费 F0 层，mp3）；"piper:" → 本地离线（wav）；
+    否则 → edge-tts 云端（mp3，失败自动回退离线 Piper）。"""
+    if voice.startswith("azure:"):
+        return synthesize_tts_azure(text, voice[len("azure:"):], rate)
     if voice.startswith("piper:"):
         return synthesize_tts_piper(text, voice[len("piper:"):], rate)
     try:
@@ -184,8 +247,16 @@ def synthesize_tts(text: str, voice: str, rate: str) -> bytes:
         except Exception as e:
             last_err = e
             _log_tts(f"[重试] 第{attempt + 1}次失败（原文前30字：{text[:30]!r}）：{e}")
+            if _is_permanent_tts_error(e):
+                break   # 403 等永久性失败（接口迁移/封禁）：不再重试，直接回退离线
             time.sleep(0.6 * (attempt + 1))   # 0.6s / 1.2s 退避后重试
-    raise RuntimeError(f"语音合成失败（已重试3次）：{last_err}")
+    # edge-tts 云端不可用（如微软 403 / 接口迁移到 v2），自动回退到本地 Piper 离线合成
+    fb = fallback_piper_voice_id(text)
+    _log_tts(f"[回退] edge-tts 合成失败，改用离线音色 {fb}：{last_err}")
+    try:
+        return synthesize_tts_piper(text, fb, rate)
+    except Exception as e:
+        raise RuntimeError(f"语音合成失败（云端重试3次 + 离线回退均失败）：{last_err} / {e}") from e
 
 def _log_tts(msg):
     """把朗读相关事件写入 ~/.pyreader/tts.log。"""
@@ -206,6 +277,11 @@ def _synth_once(edge_tts, text, voice, rate):
             raise RuntimeError("edge-tts 未返回音频")
         return b"".join(out)
     return asyncio.run(go())
+
+def _is_permanent_tts_error(e) -> bool:
+    """判断是否为 403 等不可重试的永久性失败（微软接口迁移/封禁），而非瞬时网络问题。"""
+    s = str(e)
+    return "403" in s and ("Invalid response status" in s or "Forbidden" in s or "forbidden" in s)
 
 class TtsWorker(QObject):
     ready = Signal(int, bytes)     # (句子序号, mp3 字节)

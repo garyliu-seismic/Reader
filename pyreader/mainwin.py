@@ -27,7 +27,7 @@ from .ai import (translate, lookup, AiWorker,
                   continue_story, analyze_sentiment, explain_background,
                   extract_knowledge_graph)
 from .graph import build_graph_html
-from .tts import TtsWorker, TranslateWorker, split_sentences, TTS_DEFAULT_VOICE, _log_tts
+from .tts import TtsWorker, TranslateWorker, split_sentences, TTS_DEFAULT_VOICE, _log_tts, AZURE_QUOTA_EXCEEDED
 
 # ============ 主窗口 ============
 class MainWindow(QMainWindow):
@@ -490,6 +490,8 @@ class MainWindow(QMainWindow):
                 "outer": dlg.outer.value(), "gutter": dlg.gutter.value(),
                 "tts_voice": dlg.tts_voice.currentData(),
                 "tts_rate": dlg.tts_rate.currentText(),
+                "azure_tts_key": dlg.azure_key.text().strip(),
+                "azure_tts_region": dlg.azure_region.text().strip(),
                 "theme": dlg.theme.currentText(),
                 "flip_effect": dlg.flip_effect.currentText(),
                 "bilingual": dlg.bilingual.isChecked(),
@@ -928,6 +930,10 @@ class MainWindow(QMainWindow):
         self.tts_workers.pop((epoch, seq), None)
         self.tts_failed_seqs.add(seq)
         _log_tts(f"[跳过] 第{seq + 1}句合成失败：{msg}")
+        if msg.startswith(AZURE_QUOTA_EXCEEDED):
+            self.statusBar().showMessage("⚠️ 本月 Azure 免费额度已用完，已停止朗读（可在设置切换音色，或到 Azure 升级 S0）")
+            self._tts_stop()
+            return
         if seq == self.tts_idx:      # 当前句失败 → 直接读下一句
             self.statusBar().showMessage(f"跳过无法朗读的句子（{seq + 1}/{len(self.tts_sentences)}）")
             self._tts_advance()
