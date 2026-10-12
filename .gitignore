@@ -4,6 +4,12 @@
 # AI 密钥（不提交真实密钥，只提交 .env.example）
 .env
 
+# 临时测试产物
+_test_img.png
+测试_docx.docx
+测试_扫描版.pdf
+测试_版式还原.pdf
+
 # Python 缓存
 __pycache__/
 *.pyc
