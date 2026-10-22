@@ -1,11 +1,12 @@
 """章节解析结果本地缓存。
 
 缓存策略：
-- key = SHA-1(文件绝对路径 + 文件大小 + 文件最后修改时间)
-  只要文件内容没变，key 不变，直接命中；文件更新后 key 变化，自动重解析。
+- key = SHA-1(解析器版本 + 文件绝对路径 + 文件大小 + 文件最后修改时间)
+  只要文件内容没变且章节解析器没升级，key 不变，直接命中；文件更新或
+  PARSER_VERSION 提升后 key 变化，自动重解析（旧缓存留给 LRU 淘汰）。
 - 每条缓存保存：chapters（章节列表）、title（书名）、extra_meta（版式元信息）。
-  注意：全文 text 不缓存（可能几百 MB），章节仅存 (start, end, title)，
-  重建 LazyPager 只需要这三列。
+  注意：全文 text 不缓存（可能几百 MB），章节全程统一为 (offset, title) 二元组——
+  与 textio 解析结果、LazyPager 的入参完全一致，读出即可直接喂给 LazyPager。
 - 目录下缓存文件超过 MAX_CACHE_FILES 时，按最后访问时间删最旧的。
 """
 import os
@@ -14,15 +15,16 @@ import hashlib
 from .config import CACHE_DIR
 
 MAX_CACHE_FILES = 50   # 最多缓存 50 本书的章节信息
+PARSER_VERSION = 2     # 章节检测逻辑变化（textio 重写 / 偏移含义变化）时 +1，使旧缓存失效
 
 
 def _cache_key(path: str) -> str:
-    """根据文件路径 + 大小 + 修改时间生成 SHA-1 指纹。"""
+    """根据解析器版本 + 文件路径 + 大小 + 修改时间生成 SHA-1 指纹。"""
     try:
         st = os.stat(path)
-        raw = f"{os.path.abspath(path)}|{st.st_size}|{st.st_mtime}"
+        raw = f"v{PARSER_VERSION}|{os.path.abspath(path)}|{st.st_size}|{st.st_mtime}"
     except OSError:
-        raw = os.path.abspath(path)
+        raw = f"v{PARSER_VERSION}|{os.path.abspath(path)}"
     return hashlib.sha1(raw.encode()).hexdigest()
 
 
@@ -32,7 +34,7 @@ def _cache_path(key: str) -> str:
 
 def load_cache(path: str):
     """读取缓存。命中返回 (chapters_list, title, extra_meta)，未命中返回 None。
-    chapters_list 是 [(start, end, title), ...] 的列表。
+    chapters_list 是 [(offset, title), ...]，可直接传给 LazyPager。
     """
     key = _cache_key(path)
     cp = _cache_path(key)
@@ -41,7 +43,7 @@ def load_cache(path: str):
     try:
         with open(cp, encoding="utf-8") as f:
             data = json.load(f)
-        chapters = [(c["start"], c["end"], c["title"]) for c in data["chapters"]]
+        chapters = [(int(c["start"]), c["title"]) for c in data["chapters"]]
         title = data.get("title", "")
         extra_meta = data.get("extra_meta", None)
         # 更新访问时间（用于 LRU 淘汰）
@@ -58,9 +60,10 @@ def load_cache(path: str):
 
 def save_cache(path: str, chapters, title: str, extra_meta=None):
     """将解析结果写入缓存。
-    chapters 接受两种格式：
-      - [(start, end, title), ...]   来自 textio / epub
-      - Chapter 对象列表（有 .start .end .title 属性）来自 LazyPager
+    chapters 接受：
+      - [(offset, title), ...]         来自 textio / epub / mobi（标准形态）
+      - [(start, end, title), ...]     旧三元组，取首尾两列
+      - Chapter 对象列表（有 .start .title 属性）来自 LazyPager
     extra_meta 保存 extra dict 中不含二进制数据的轻量字段（mode / blocks 摘要等）。
     """
     key = _cache_key(path)
@@ -69,11 +72,12 @@ def save_cache(path: str, chapters, title: str, extra_meta=None):
         ch_list = []
         for c in chapters:
             if isinstance(c, (list, tuple)):
-                s, e, t = c[0], c[1], c[2]
+                s, t = c[0], c[-1]
             else:
-                s, e, t = c.start, c.end, c.title
-            ch_list.append({"start": s, "end": e, "title": t})
+                s, t = c.start, c.title
+            ch_list.append({"start": s, "title": t})
         data = {"title": title, "chapters": ch_list, "extra_meta": extra_meta}
+        os.makedirs(CACHE_DIR, exist_ok=True)
         with open(cp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
         _evict()

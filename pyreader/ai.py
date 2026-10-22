@@ -2,6 +2,7 @@ import json
 import urllib.request
 from urllib.parse import urlparse
 from PySide6.QtCore import QObject, Signal
+from .config import net_urlopen
 
 # ---- 超时（秒）：摘要/问答/续写允许更长推理时间 ----
 _SHORT_TIMEOUT = 30
@@ -62,7 +63,7 @@ def call_llm(prompt, cfg, timeout=_SHORT_TIMEOUT, messages=None):
         data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json",
                  "Authorization": "Bearer " + key})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with net_urlopen(req, timeout=timeout) as r:
         return json.loads(r.read())["choices"][0]["message"]["content"]
 
 def translate(text, cfg):

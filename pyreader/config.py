@@ -1,6 +1,10 @@
 """PyReader 全局配置：路径、排版常量、主题、AI 预设、JSON 读写、字体选择、多媒体。"""
 import os
+import sys
 import json
+import time
+import urllib.request
+import urllib.error
 from pathlib import Path
 
 # ---- 数据存储路径 ----
@@ -10,6 +14,106 @@ CONFIG_PATH    = os.path.join(APP_DIR, "config.json")
 BOOKMARKS_PATH = os.path.join(APP_DIR, "bookmarks.json")
 CACHE_DIR      = os.path.join(APP_DIR, "cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
+
+
+# ---- 网络访问策略（Reader 自己的代理，不读系统代理）----
+# 背景：Windows 上 urllib 会自动读取注册表里的系统代理（HKCU\...\Internet Settings 的
+# ProxyEnable / ProxyServer），环境变量 HTTP(S)_PROXY 同样会被读取。实测：系统代理指向一个
+# 已失效的本地端口（sing-box 退出/规则变更后残留）时，Azure TTS 报 WinError 10054 或 TLS
+# 握手超时，DeepSeek 一直卡住，表现为「朗读没声音、翻译转圈」——而绕过代理直连是通的。
+#
+# 所以 Reader 完全不看系统代理，只认自己的设置（设置界面 / .env 的 PYREADER_PROXY）：
+#   proxy 为空     → 直连（走 sing-box TUN 时仍会被 TUN 接管，按 sing-box 路由规则分流）
+#   proxy 非空     → 先走该代理（如 sing-box 的 mixed 入站 http://127.0.0.1:1081）
+# 并且带**自动降级**：代理在连接层失败时立刻改直连重试，并冷却一段时间不再碰代理，
+# 避免像今天那样每句朗读都白等一次 30s 超时。
+NET_PROXY = os.environ.get("PYREADER_PROXY", "").strip()   # 启动时会被 cfg["proxy"] 覆盖
+PROXY_COOLDOWN = 120.0        # 代理连不上后，多少秒内直接走直连
+_proxy_down_until = 0.0
+_proxy_opener = None
+_direct_opener = None
+
+
+def set_net_proxy(url: str):
+    """设置 Reader 专用代理（如 http://127.0.0.1:1081）；空字符串 = 直连。"""
+    global NET_PROXY, _proxy_opener, _proxy_down_until
+    NET_PROXY = (url or "").strip()
+    _proxy_opener = None            # 代理地址变了 → 重建 opener
+    _proxy_down_until = 0.0         # 手改设置后重新给代理一次机会
+
+
+def _opener(use_proxy: bool):
+    global _proxy_opener, _direct_opener
+    if use_proxy:
+        if _proxy_opener is None:
+            _proxy_opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": NET_PROXY, "https": NET_PROXY}))
+        return _proxy_opener
+    if _direct_opener is None:
+        # 显式空的 ProxyHandler → 直连，不读注册表/环境变量代理
+        _direct_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return _direct_opener
+
+
+def _log_net(msg: str):
+    try:
+        with open(os.path.join(APP_DIR, "tts.log"), "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+    except Exception:
+        pass
+
+
+def _fresh_request(req):
+    """克隆一个 Request。
+
+    urllib 的 ProxyHandler 会**就地改写** Request（`set_proxy()` 把 host 改成代理地址），
+    所以代理试失败后，同一个 Request 对象再去直连会连到代理端口上（实测报 WinError 10061）。
+    这里每次尝试都从 full_url 重新构造一个干净的 Request。"""
+    r = urllib.request.Request(req.full_url, data=req.data, method=req.get_method())
+    r.headers = dict(req.headers)
+    r.unredirected_hdrs = dict(req.unredirected_hdrs)
+    r.origin_req_host = req.origin_req_host
+    r.unverifiable = req.unverifiable
+    return r
+
+
+def net_urlopen(req, timeout=30):
+    """统一的 urlopen 入口：先试 Reader 自己的代理（若配了），连接层失败则降级直连。
+
+    HTTPError（4xx/5xx）是服务端正常应答，直接抛出，不触发降级重试。"""
+    global _proxy_down_until
+    try_proxy = bool(NET_PROXY) and time.time() >= _proxy_down_until
+    last_err = None
+    for use_proxy in ([True, False] if try_proxy else [False]):
+        try:
+            return _opener(use_proxy).open(_fresh_request(req), timeout=timeout)
+        except urllib.error.HTTPError:
+            raise
+        except Exception as e:
+            last_err = e
+            if use_proxy:
+                _proxy_down_until = time.time() + PROXY_COOLDOWN
+                _log_net(f"[网络] 代理 {NET_PROXY} 连不上（{e}），{int(PROXY_COOLDOWN)}s 内改直连")
+    raise last_err
+
+
+def bundled_models_dir():
+    """返回随程序一起分发的离线模型根目录（内含 sherpa_models/、piper_models/），
+    用于 U 盘/安装包「一键离线」分发（Melo / Kokoro / Piper 模型无需再联网下载）。
+
+    查找位置：
+      - PyInstaller / 安装版：<exe 所在目录>/models
+      - 源码运行：Reader/models（项目根目录下）
+    不存在时返回 None。"""
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        roots = [os.path.join(exe_dir, "models")]
+    else:
+        roots = [os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models")]
+    for r in roots:
+        if os.path.isdir(r):
+            return r
+    return None
 
 # ---- 排版常量 ----
 OUTER = 16.0            # 页面距窗口边距
@@ -24,15 +128,18 @@ WHEEL_THRESHOLD = 80.0  # 滚轮/滑动翻页触发阈值（角度单位）
 INDENT_SPACES = 2       # 段落首行缩进（中文字符数）
 PARA_SPACING = 0.5      # 段落间距（行高的倍数）
 CLICK_ZONE = 0.28       # 单击左右两侧翻页的触发宽度（占窗口比例）
-FLIP_MS = 380            # 3D 翻页动画时长（毫秒）
+FLIP_MS = 800            # 3D 翻页动画时长（毫秒）
+FLIP_STRIPS = 20          # 卷曲页竖带数（越大越平滑，越慢）
+FLIP_CURL = 0.9           # 卷曲强度：自由端相对书脊端滞后的最大角度(弧度)，0=刚性平板
+FLIP_TILT = 0.14          # 斜翻强度：上下角自由边位置差（0=不斜）
 FLIP_PERSPECTIVE = 5.0   # 翻页透视强度（相机距离 = 页宽 × 该系数，越小越夸张/文字越压缩）
 
 # ---- 多媒体（语音朗读用）----
+# 实际播放用 QAudioSink 持续流（见 .ttsplayer.TtsPlayer），这里只是检测 QtMultimedia 模块是否可用。
 try:
-    from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+    from PySide6.QtMultimedia import QAudioSink  # noqa: F401  仅用于模块可用性探测
     _HAS_MULTIMEDIA = True
 except Exception:
-    QMediaPlayer = QAudioOutput = None
     _HAS_MULTIMEDIA = False
 
 
@@ -73,22 +180,29 @@ DEFAULT_CONFIG = {"font_family": "", "font_size": 15,
                   "api_base": "https://YOUR-RESOURCE.openai.azure.com/openai/v1",
                   "model": "gpt-4o-mini",
                   "api_version": "",
-                  "tts_voice": "zh-CN-XiaoxiaoNeural", "tts_rate": "+0%",
+                  "tts_voice": "sherpa:melo-zh_en", "tts_rate": "+0%",
+                  "proxy": "",
                   "azure_tts_key": "", "azure_tts_region": "",
+                  "azure_tts_key2": "", "azure_tts_region2": "",
                   "theme": DEFAULT_THEME, "recent": [],
                   "bilingual": False, "bilingual_target": "中文",
                   "flip_effect": DEFAULT_FLIP_EFFECT}
 
 
-# ---- 从 .env 自动读取 Azure AI Foundry 配置 ----
+# ---- 从 .env 自动读取 AI 配置（DeepSeek 翻译 + Azure Speech 朗读）----
 # 搜索顺序（优先级递减）：
-#   1. Reader 项目根目录 .env          ← 发给别人时放这里（最优先）
-#   2. Reader 同级目录 coding-agent/.env  ← 开发者共用
+#   1. 打包/安装版：exe 同目录 .env         ← 便携版 / 安装目录（随包分发）
+#   2. Reader 项目根目录 .env              ← 源码运行时放这里（最优先）
+#   3. Reader 同级目录 coding-agent/.env   ← 开发者共用
 # 仅在 config.json 尚无 api_key 时作为默认值使用（不会覆盖用户已保存的设置）
-_ENV_SEARCH_PATHS = [
-    Path(__file__).parent.parent / ".env",                            # Reader/.env  ← 发布时放这里
-    Path(__file__).parent.parent.parent / "coding-agent" / ".env",   # ../coding-agent/.env
-]
+def _env_search_paths():
+    if getattr(sys, "frozen", False):
+        # PyInstaller/安装版：.env 与 exe 同目录（U 盘便携版 / {app} 安装目录）
+        return [Path(os.path.dirname(os.path.abspath(sys.executable))) / ".env"]
+    return [
+        Path(__file__).parent.parent / ".env",                            # Reader/.env  ← 发布时放这里
+        Path(__file__).parent.parent.parent / "coding-agent" / ".env",   # ../coding-agent/.env
+    ]
 
 
 def _parse_dotenv(path: Path) -> dict:
@@ -108,18 +222,22 @@ def _parse_dotenv(path: Path) -> dict:
 
 
 def load_env_defaults() -> dict:
-    """读取 coding-agent/.env，返回可直接合并进 cfg 的字典。
+    """读取 .env，返回可直接合并进 cfg 的字典。
 
     变量映射：
       DEEPSEEK_BASE_URL          → api_base
       DEEPSEEK_API_KEY           → api_key
       DEEPSEEK_MODEL             → model
       CODING_AGENT_TEMPERATURE   → temperature（"none" 表示不传该参数）
-    （coding-agent 沿用了 DEEPSEEK_ 前缀，实际已指向 Azure AI Foundry）
+      AZURE_TTS_KEY              → azure_tts_key
+      AZURE_TTS_REGION           → azure_tts_region
+      AZURE_TTS_KEY2             → azure_tts_key2
+      AZURE_TTS_REGION2          → azure_tts_region2
+      PYREADER_PROXY             → proxy（Reader 专用代理，如 sing-box 的 http://127.0.0.1:1081）
     """
-    for p in _ENV_SEARCH_PATHS:
+    for p in _env_search_paths():
         env = _parse_dotenv(p)
-        if env.get("DEEPSEEK_API_KEY") or env.get("DEEPSEEK_BASE_URL"):
+        if env.get("DEEPSEEK_API_KEY") or env.get("DEEPSEEK_BASE_URL") or env.get("AZURE_TTS_KEY"):
             result = {}
             if env.get("DEEPSEEK_BASE_URL"):
                 result["api_base"] = env["DEEPSEEK_BASE_URL"]
@@ -130,6 +248,16 @@ def load_env_defaults() -> dict:
             # CODING_AGENT_TEMPERATURE=none 表示略去 temperature 字段（gpt-5 系列要求）
             t = env.get("CODING_AGENT_TEMPERATURE", "").strip().lower()
             result["temperature"] = "none" if t == "none" else (float(t) if t else 0.2)
+            if env.get("AZURE_TTS_KEY"):
+                result["azure_tts_key"] = env["AZURE_TTS_KEY"]
+            if env.get("AZURE_TTS_REGION"):
+                result["azure_tts_region"] = env["AZURE_TTS_REGION"]
+            if env.get("AZURE_TTS_KEY2"):
+                result["azure_tts_key2"] = env["AZURE_TTS_KEY2"]
+            if env.get("AZURE_TTS_REGION2"):
+                result["azure_tts_region2"] = env["AZURE_TTS_REGION2"]
+            if env.get("PYREADER_PROXY"):
+                result["proxy"] = env["PYREADER_PROXY"]
             return result
     return {}
 

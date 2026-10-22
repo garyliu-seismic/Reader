@@ -17,9 +17,21 @@ __pycache__/
 # 打包产物
 build/
 dist/
+release/
 *.zip
+
+# 测试数据
+_test_img.png
+测试_docx.docx
+测试_扫描版.pdf
+测试_版式还原.pdf
 
 # 编辑器 / 系统杂物
 .vscode/
 .DS_Store
 Thumbs.db
+
+# 离线 TTS 模型（Melo/Kokoro/Piper，合计约 450MB，不入库；安装包构建时由 prep_models.py 预置）
+installer_models/
+models/
+prep_models.log

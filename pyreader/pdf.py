@@ -6,7 +6,7 @@ from PySide6.QtGui import QFontMetricsF
 from .model import Line, Page
 from .markdown import (_md_heading_font, _md_mono_font, _table_lines, _wrap_pieces,
                        _line_from_pieces, MD_BOLD, MD_ITALIC, MD_CODE, MD_H_GAP, MD_LIST_INDENT)
-from .textio import scan_chapters, load_epub, load_html_file
+from .textio import scan_chapters, load_epub, load_html_file, load_mobi6
 
 # ============ PDF 版式解析（保留标题/粗斜体/段落/列表/代码/表格） ============
 _PDF_MONO_HINTS = ("mono", "courier", "consola", "typewriter", "menlo", "code", "fixed")
@@ -797,5 +797,5 @@ def load_kindle(path):
     if ext == ".epub":
         return load_epub(out)        # KF8 (azw3) → epub
     if ext in (".html", ".htm"):
-        return load_html_file(out)   # 旧版 mobi/azw/prc → html
+        return load_mobi6(out)       # 旧版 mobi/azw/prc → html（章节取同目录 toc.ncx）
     raise RuntimeError("此 Kindle 文件为 PDF 型（Print Replica），暂不支持，请先转换为 EPUB")
