@@ -23,6 +23,7 @@ from . import sync as syncmod
 from .sync import SyncWorker
 from .view import PageView
 from .settings import SettingsDialog
+from . import shelf as shelfmod
 from .shelfview import ShelfView
 from .ai import (translate, lookup, AiWorker,
                   summarize_chapter, extract_mindmap, ai_qa,
@@ -204,6 +205,8 @@ class MainWindow(QMainWindow):
         self.sync.remoteList.connect(self._fill_remote_menu)
         self._loaded_path = None       # 已完成加载的书（远端进度到达时用来判断能否立刻应用）
         self._pending_remote = None    # 在书加载完成前到达的远端进度
+        self._seed_push = None         # 首次打开云端缓存副本时从本地副本种入了进度：等远端确认没有记录后推送一次
+        self._seed_remote_none = False
         self._last_saved_offset = None
         self._progress_timer = QTimer(self)
         self._progress_timer.setInterval(30000)
@@ -255,6 +258,7 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentIndex(0 if start_shelf else 1)
         self._sync_page_state()
         QTimer.singleShot(300, self.shelf.rescan_if_stale)   # 先用 index.json 缓存画界面，稍后后台增量扫描
+        QTimer.singleShot(3000, self.shelf.sync_cloud_if_stale)   # 云端书库：延迟几秒再读（未启用 WebDAV 时是空操作）
         if book_path:
             self.load_book(book_path)
 
@@ -344,7 +348,7 @@ class MainWindow(QMainWindow):
     def _shelf_context(self):
         """书架后台扫描需要的活数据（在主线程取；书架自己拷贝快照再交给线程）。"""
         return {"library_dirs": self.cfg.get("library_dirs", []), "recent": self.cfg.get("recent", []),
-                "bookmarks": self.bookmarks}
+                "bookmarks": self.bookmarks, "cfg": self.cfg}      # cfg：webdav_* 决定云端书库是否并入书架
 
     def _shelf_visible(self):
         return self.stack.currentWidget() is self.shelf
@@ -527,7 +531,18 @@ class MainWindow(QMainWindow):
         self.shelf.note_progress(self.book_path, rec["percent"], rec["updated"], rec["device"])
         return self.sync.push(self.cfg, rec)
 
+    def _maybe_push_seed(self):
+        """首次打开云端缓存副本、进度是从本地副本种入的：书已加载且远端确认没有记录时，推送一次 remote: 进度。"""
+        if (self._seed_push and self._seed_push == self.book_path and self._seed_remote_none
+                and self._loaded_path == self.book_path and self.pager):
+            self._seed_push = None
+            self._save_progress(force=True)
+
     def _on_remote_progress(self, book_path, remote):
+        if remote is None and book_path == self.book_path and self._seed_push == book_path:
+            self._seed_remote_none = True        # 远端没有这本书的进度：种入的本地进度要推上去
+            self._maybe_push_seed()
+            return
         if remote is None or book_path != self.book_path:
             return
         if self._loaded_path != book_path or not self.pager:
@@ -591,6 +606,19 @@ class MainWindow(QMainWindow):
         self._save_progress(force=True)      # 切书前先存当前书的进度
         self._loaded_path = None
         self._pending_remote = None
+        self._seed_push, self._seed_remote_none = None, False
+        try:
+            seed = shelfmod.progress_seed(self.bookmarks, path)    # 云端缓存副本首次打开：带上本机另一路径上读到的进度
+        except Exception:
+            seed = None                      # 种入只是锦上添花：任何意外都不能挡住打开
+        if seed:
+            ent = self.bookmarks.setdefault(path, {})
+            ent["_progress_"], ent["_progress_ts_"] = seed["_progress_"], seed["_progress_ts_"]
+            try:
+                save_json(BOOKMARKS_PATH, self.bookmarks)
+            except Exception:
+                pass
+            self._seed_push = path
         self.book_path = path
         self.sync.pull(self.cfg, path)       # 未启用时是 no-op
         self.load_bar.show()
@@ -656,6 +684,7 @@ class MainWindow(QMainWindow):
             _, remote = self._pending_remote
             self._pending_remote = None
             self._apply_remote_progress(remote)
+        self._maybe_push_seed()
 
     # ---- 章节导航（惰性分页的入口） ----
     def load_chapter(self, ci, goto_end=False):
