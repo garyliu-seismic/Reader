@@ -347,7 +347,7 @@ def _coerce_remote(x) -> Optional[RemoteFile]:
 
 def build_books(local_files: Iterable[LocalFile] = (), remote_files=None, overlay: Optional[dict] = None, *,
                 bookmarks=None, recent: Iterable[str] = (), opened: Optional[dict] = None,
-                removed: Iterable[str] = ()) -> Dict[str, Book]:
+                removed: Iterable[str] = (), removed_files: Iterable = ()) -> Dict[str, Book]:
     """把本地扫描、云端列表、覆盖层视图与进度归并成 {book_id: Book}。纯函数，不做网络。
 
     - remote_files：None 表示云端列表未知（离线 / 列表不完整）；此时不会据列表推断任何「消失」。
@@ -355,6 +355,8 @@ def build_books(local_files: Iterable[LocalFile] = (), remote_files=None, overla
       其它本地文件即使文件名+大小相同也是独立卡片，仅在 same_as 里互相提示。
     - 同一 book_id 的多个本地路径（同名同大小的拷贝）合成一张卡片（book_id 的既有语义）。
     - removed：调用方按「连续两轮完整列表都缺失」判定出的 id 集合；本函数不做二轮判断。
+    - removed_files：被判定为已移除的云端书的最后已知条目（RemoteFile / (rel, size, mtime)）；
+      本机没有副本、覆盖层里也没有它们时，靠这个才能在「云端已移除」书架里显示。
     - overlay：validate_overlay / merge 产生的视图（None = 无覆盖层）。
     """
     sync = _sync()
@@ -401,6 +403,17 @@ def build_books(local_files: Iterable[LocalFile] = (), remote_files=None, overla
             b.local_paths.append(f.path)
         if b.where == "cloud":
             b.where = "synced"
+
+    # 2b) 云端已移除、本机没有副本的书：靠最后已知的列表条目显示（默认隐藏，仅「云端已移除」书架可见）
+    if remote_files is not None:
+        for x in (removed_files or ()):
+            r = _coerce_remote(x)
+            bid = "remote:" + r.rel if r is not None else ""
+            if r is None or bid in books or bid not in removed:
+                continue
+            name = r.rel.rsplit("/", 1)[-1]
+            books[bid] = Book(bid, _stem(name), os.path.splitext(name)[1].lstrip(".").lower(), r.size,
+                              shelf_of_remote(r.rel), fp_weak(name, r.size), "removed", r.rel, r.mtime)
 
     # 3) 覆盖层里有、本机什么都没找到的条目 → 占位
     for bid in sorted(entries):
@@ -978,10 +991,31 @@ def _clean_cursors(cur) -> dict:
     return {"peers": peers, "rounds_since_full": _int(cur.get("rounds_since_full"), 0, 0)}
 
 
+MAX_MISSING = 5000
+
+
+def _clean_cloud(cl) -> dict:
+    """state.json 的 cloud 段：{"missing": {book_id: {"n": 连续缺失的完整列表轮数, "size", "mtime"}}}。
+    只收 remote: 的合法 id、n 为 1..99 的整数；坏条目逐条丢弃。"""
+    cl = cl if isinstance(cl, dict) else {}
+    out = {}
+    raw = cl.get("missing") if isinstance(cl.get("missing"), dict) else {}
+    for bid, v in list(raw.items())[:MAX_MISSING]:
+        if not isinstance(bid, str) or not bid.startswith("remote:") or not valid_book_id(bid) or not isinstance(v, dict):
+            continue
+        n = _int(v.get("n"), 0, 1, 99)
+        size = _int(v.get("size"), 0, 0)
+        mt = _num(v.get("mtime"), 0.0)
+        if n:
+            out[bid] = {"n": n, "size": size, "mtime": mt}
+    return {"missing": out}
+
+
 def default_state(device_id: Optional[str] = None) -> dict:
     return {"version": STATE_VERSION, "device_id": device_id or new_device_id(), "clock_skew_ms": 0,
             "confirmed_upload": False, "pushed_rev": 0, "pushed_hash": "", "remote_stamp": None,
-            "ui": dict(DEFAULT_UI, collapsed=[]), "cursors": {"peers": {}, "rounds_since_full": 0}}
+            "ui": dict(DEFAULT_UI, collapsed=[]), "cursors": {"peers": {}, "rounds_since_full": 0},
+            "cloud": {"missing": {}}}
 
 
 def load_state(root: Optional[str] = None) -> dict:
@@ -1010,6 +1044,7 @@ def load_state(root: Optional[str] = None) -> dict:
     st["remote_stamp"] = _clean_stamp(raw.get("remote_stamp"))
     st["ui"] = _clean_ui(raw.get("ui"))
     st["cursors"] = _clean_cursors(raw.get("cursors"))
+    st["cloud"] = _clean_cloud(raw.get("cloud"))
     if st["version"] > STATE_VERSION:
         st["_readonly"] = True               # 更高主版本：只读不写
     elif fresh:
@@ -1148,11 +1183,12 @@ def _trim_notes(d: dict, key) -> dict:
 
 def index_to_wire(books: Dict[str, Book], opened: Optional[dict] = None, progress: Optional[dict] = None,
                   built: Optional[float] = None) -> dict:
-    """派生索引（可随时删除、可重建）。只写本机有文件的书；opened / progress 是本机独有的记录
+    """派生索引（可随时删除、可重建）。写本机有文件的书，以及云端列表里的书（cloud / removed，没有本地路径）——
+    后者让离线启动时仍能显示云端书库；opened / progress 是本机独有的记录
     （书籍扫描会整体替换 books，这两份不能从扫描里重建，所以随索引一起落盘）。"""
     entries = {}
     for bid, b in sorted(books.items()):
-        if not b.local_paths or not valid_book_id(bid):
+        if not valid_book_id(bid) or not (b.local_paths or (b.remote_rel and b.where in ("cloud", "removed"))):
             continue
         e = {"fp": b.fp, "title": b.title, "format": b.fmt, "size": int(b.size), "shelf": b.shelf,
              "where": b.where, "mtime": float(b.mtime), "local": list(b.local_paths[:MAX_LOCAL_PATHS]),
@@ -1198,12 +1234,12 @@ def index_from_wire(raw):
             lp = e.get("local") if isinstance(e.get("local"), list) else []
             paths = [q for q in (_clean_path(p) for p in lp[:MAX_LOCAL_PATHS]) if q]
             title = _clean_str(e.get("title"))
-            if not paths or not title:
-                continue
             size = e.get("size")
             where = e.get("where") if e.get("where") in _WHERE else "local"
             rem = e.get("remote") if isinstance(e.get("remote"), dict) else {}
             rel = rem.get("rel") if valid_remote_rel(rem.get("rel")) else ""
+            if not title or not (paths or (rel and bid == "remote:" + rel and where in ("cloud", "removed"))):
+                continue                         # 没有本地路径的只能是云端列表里的书
             b = Book(bid, title, _clean_str(e.get("format"), 16) or "",
                      size if isinstance(size, int) and not isinstance(size, bool) and 0 <= size < 2 ** 53 else 0,
                      _clean_str(e.get("shelf"), MAX_PATH_STR) or "", _clean_str(e.get("fp"), 64) or "", where, rel,
@@ -1269,3 +1305,52 @@ def reset_index(root: Optional[str] = None) -> None:
         os.remove(index_path(root))
     except OSError:
         pass
+
+
+# ================================================================== 阶段 3：首次打开云端书缓存副本时种入本地进度
+def progress_seed(bookmarks, copy_path: str) -> Optional[dict]:
+    """用户在本机另一个路径上读过同一个文件、现在第一次打开它的云端缓存副本（remote_books/<rel>）时，
+    把本地进度带过来（design §4.9）：返回 {"_progress_": 偏移, "_progress_ts_": 时间, "source": 来源路径}，否则 None。
+
+    只在副本自己还没有进度（bookmarks 里没有或 _progress_ <= 0）时种入。来源必须是 bookmarks 里
+    文件名（NFC）相同、不在 remote_books 内、文件仍存在、大小相同、强指纹 fp 相同且 _progress_ 为有限正数的路径；
+    多个来源取 _progress_ts_ 最新者。只读，不改 bookmarks；写入由调用者做。"""
+    if not isinstance(bookmarks, dict) or not isinstance(copy_path, str):
+        return None
+    sync = _sync()
+    if sync._remote_rel(copy_path) is None or not os.path.isfile(copy_path):
+        return None
+    own = bookmark_for(bookmarks, copy_path)
+    if own and (_num(own.get("_progress_"), 0.0) or 0.0) > 0:
+        return None
+    try:
+        size = os.path.getsize(copy_path)
+    except OSError:
+        return None
+    base, mine = _nfc(os.path.basename(copy_path)), norm_path(copy_path)
+    copy_fp = None
+    best = None
+    for k, v in list(bookmarks.items()):
+        if not isinstance(k, str) or not isinstance(v, dict) or not k:
+            continue
+        if _nfc(os.path.basename(k.replace("\\", "/"))) != base or norm_path(k) == mine:
+            continue
+        off = _num(v.get("_progress_"))
+        if off is None or off <= 0 or off >= 2 ** 53 or sync._remote_rel(k) is not None:
+            continue
+        ts = _num(v.get("_progress_ts_"), 0.0)
+        if best is not None and ts <= best["_progress_ts_"]:
+            continue
+        try:
+            if not os.path.isfile(k) or os.path.getsize(k) != size:
+                continue
+        except OSError:
+            continue
+        if copy_fp is None:
+            copy_fp = fp(copy_path)
+            if copy_fp is None:
+                return None
+        if fp(k) != copy_fp:
+            continue
+        best = {"_progress_": int(off), "_progress_ts_": ts, "source": k}
+    return best

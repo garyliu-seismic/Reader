@@ -110,11 +110,16 @@ def test_index_roundtrip_through_json(tmp_path):
     assert b.last_read >= 1_700_000_200.0 and b.status == "reading"
 
 
-def test_index_skips_books_without_local_file_and_has_no_secrets(tmp_path):
+def test_index_skips_placeholders_and_has_no_secrets(tmp_path):
+    """没有本地文件的书：只有云端列表里的书（cloud / removed，带合法 rel）进索引（阶段 3，离线启动也能显示云端书库）；
+    其它设备的占位（missing）、没有 rel 的都不进。"""
     books, _ = _books(tmp_path)
     books["remote:云端.epub"] = Book("remote:云端.epub", "云端", "epub", 5, "cloud:", "", "cloud", "云端.epub")
+    books["remote:占位.epub"] = Book("remote:占位.epub", "占位", "epub", 5, "cloud:", "", "missing", "占位.epub")
+    books["local:" + "a" * 40] = Book("local:" + "a" * 40, "别机", "epub", 5, "", "", "missing")
     wire = shelf.index_to_wire(books)
-    assert "remote:云端.epub" not in wire["books"] and len(wire["books"]) == 2
+    assert "remote:云端.epub" in wire["books"] and wire["books"]["remote:云端.epub"]["local"] == []
+    assert "remote:占位.epub" not in wire["books"] and "local:" + "a" * 40 not in wire["books"] and len(wire["books"]) == 3
     text = json.dumps(wire)
     for k in ("api_key", "webdav_password", "azure"):
         assert k not in text
