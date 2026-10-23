@@ -3,12 +3,12 @@ import re
 import threading
 from typing import Optional
 from PySide6.QtCore import Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QFont, QPixmap, QPainter, QColor, QIcon, QDesktopServices
+from PySide6.QtGui import QFont, QPixmap, QPainter, QColor, QIcon, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (QMainWindow, QWidget, QListWidget, QListWidgetItem,
                                QToolBar, QMenu, QFontDialog, QTextEdit, QVBoxLayout, QLabel,
                                QFileDialog, QMessageBox, QProgressBar, QSlider, QDockWidget,
                                QLineEdit, QToolButton, QWidgetAction, QHBoxLayout, QFrame,
-                               QTabWidget, QPushButton, QSizePolicy, QSplitter)
+                               QTabWidget, QPushButton, QSizePolicy, QSplitter, QStackedWidget)
 from .config import (view_count, view_of_page, CONFIG_PATH, BOOKMARKS_PATH, OUTER, MARGIN_X, MARGIN_Y, GUTTER,
                      load_env_defaults,
                      LINE_SPACING, PARA_SPACING, _HAS_MULTIMEDIA,
@@ -23,6 +23,7 @@ from . import sync as syncmod
 from .sync import SyncWorker
 from .view import PageView
 from .settings import SettingsDialog
+from .shelfview import ShelfView
 from .ai import (translate, lookup, AiWorker,
                   summarize_chapter, extract_mindmap, ai_qa,
                   continue_story, analyze_sentiment, explain_background,
@@ -133,7 +134,21 @@ class MainWindow(QMainWindow):
         right = QWidget(); rv = QVBoxLayout(right); rv.setContentsMargins(0, 0, 0, 0)
         rv.addWidget(self.ai_tabs)
 
-        self.setCentralWidget(self.view)                 # 沉浸阅读：默认全宽
+        # 中央控件：QStackedWidget。第 0 页书架（ShelfView），第 1 页现有阅读页（self.view，属性名不变）。
+        self.shelf = ShelfView(self._shelf_context,
+                               default_view=self.cfg.get("shelf_default_view", "grid"),
+                               default_sort=self.cfg.get("shelf_default_sort", "last_read"))
+        self.shelf.openRequested.connect(self._open_from_shelf)
+        self.shelf.addLibraryRequested.connect(self._add_library_dir)
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self.shelf)                 # 第 0 页：书架
+        self.stack.addWidget(self.view)                  # 第 1 页：阅读页
+        self.setCentralWidget(self.stack)                # 沉浸阅读：默认全宽
+        self._resized_on_shelf = False    # 书架可见期间窗口变过大小 / 书加载完成：回阅读页时要重排
+        self._shelf_open_pending = False  # 从书架双击打开：加载失败时回书架
+        self._reader_title = ""
+        self._reader_acts = []            # 依赖阅读页的工具栏动作（书架可见时禁用）
+        self._reader_widgets = []
         self.toc_dock = QDockWidget("目录 / 书签", self)
         self.toc_dock.setWidget(left)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.toc_dock)
@@ -192,7 +207,7 @@ class MainWindow(QMainWindow):
         self._last_saved_offset = None
         self._progress_timer = QTimer(self)
         self._progress_timer.setInterval(30000)
-        self._progress_timer.timeout.connect(lambda: self._save_progress(force=False))
+        self._progress_timer.timeout.connect(self._on_progress_tick)
         self._progress_timer.start()
 
         self._build_toolbar(); self._build_menus()
@@ -234,28 +249,38 @@ class MainWindow(QMainWindow):
 
         self.statusBar().showMessage("就绪")
         self.resize(1280, 800)
+        # 启动页：指定了书 → 阅读页（load_book 会切页）；否则「启动时显示书架」或没有可用的最近阅读 → 书架
+        has_recent = any(isinstance(p, str) and os.path.exists(p) for p in self.cfg.get("recent", []))
+        start_shelf = (not book_path) and (bool(self.cfg.get("shelf_start_in_shelf", False)) or not has_recent)
+        self.stack.setCurrentIndex(0 if start_shelf else 1)
+        self._sync_page_state()
+        QTimer.singleShot(300, self.shelf.rescan_if_stale)   # 先用 index.json 缓存画界面，稍后后台增量扫描
         if book_path:
             self.load_book(book_path)
 
     def _build_toolbar(self):
         tb = QToolBar(); self.addToolBar(tb)
+
+        def R(act):                       # 登记「依赖阅读页」的动作：书架可见时禁用
+            self._reader_acts.append(act)
+            return act
         tb.addAction("打开", self.open_book)
         tb.addAction("字体", self.choose_font)
         tb.addAction("设置", self.open_settings)
         tb.addSeparator()
-        tb.addAction("◀ 上一页", lambda: self.view.flip(-1))
-        tb.addAction("下一页 ▶", lambda: self.view.flip(1))
-        tb.addAction("添加书签", self.add_bookmark)
-        self.single_act = tb.addAction("📄 单页", lambda: self.set_single_page(self.single_act.isChecked()))
+        R(tb.addAction("◀ 上一页", lambda: self.view.flip(-1)))
+        R(tb.addAction("下一页 ▶", lambda: self.view.flip(1)))
+        R(tb.addAction("添加书签", self.add_bookmark))
+        self.single_act = R(tb.addAction("📄 单页", lambda: self.set_single_page(self.single_act.isChecked())))
         self.single_act.setCheckable(True)
         self.single_act.setToolTip("单页 / 双页跨页 切换")
         tb.addSeparator()
-        self.tts_act = tb.addAction("🔊 朗读", self.toggle_reading)
-        self.stop_act = tb.addAction("⏹ 停止", self.stop_reading)
+        self.tts_act = R(tb.addAction("🔊 朗读", self.toggle_reading))
+        self.stop_act = R(tb.addAction("⏹ 停止", self.stop_reading))
         self.stop_act.setEnabled(False)
-        self.bilingual_act = tb.addAction("🌐 双语", self.toggle_bilingual)
+        self.bilingual_act = R(tb.addAction("🌐 双语", self.toggle_bilingual))
         self.bilingual_act.setCheckable(True)
-        self.sleep_act = tb.addAction("⏰ 定时")
+        self.sleep_act = R(tb.addAction("⏰ 定时"))
         self.sleep_act.setMenu(self._build_sleep_menu())
         tb.addSeparator()
         tb.addAction(self.toc_dock.toggleViewAction())   # 目录 显示/隐藏
@@ -284,6 +309,12 @@ class MainWindow(QMainWindow):
         self.remote_menu.aboutToShow.connect(self._rebuild_remote_menu)
         self.remote_act = tb.addAction("☁️ 远程书库")
         self.remote_act.setMenu(self.remote_menu)
+        # 书架（可勾选，Ctrl+B；阅读页按 Esc 也回书架）
+        self.shelf_act = tb.addAction("📖 书架")
+        self.shelf_act.setCheckable(True)
+        self.shelf_act.setShortcut(QKeySequence("Ctrl+B"))
+        self.shelf_act.setToolTip("书架 (Ctrl+B)")
+        self.shelf_act.triggered.connect(self._on_shelf_act)
         tb.addSeparator()
         # AI 辅助功能组
         ai_menu = QMenu("AI 功能", self)
@@ -295,7 +326,7 @@ class MainWindow(QMainWindow):
         ai_menu.addSeparator()
         ai_menu.addAction("😊 情感分析（选中文字）", self._ai_sentiment_selection)
         ai_menu.addAction("🔍 背景解读（选中文字）", self._ai_background_selection)
-        self.ai_menu_act = tb.addAction("🤖 AI功能")
+        self.ai_menu_act = R(tb.addAction("🤖 AI功能"))
         self.ai_menu_act.setMenu(ai_menu)
         # 全文搜索
         tb.addSeparator()
@@ -305,8 +336,73 @@ class MainWindow(QMainWindow):
         self.search_box.textChanged.connect(self._on_search_changed)
         self.search_box.returnPressed.connect(self._search_next)
         tb.addWidget(self.search_box)
-        tb.addAction("↑", self._search_prev)
-        tb.addAction("↓", self._search_next)
+        self._reader_widgets.append(self.search_box)
+        R(tb.addAction("↑", self._search_prev))
+        R(tb.addAction("↓", self._search_next))
+
+    # ---- 书架 / 阅读页切换 ----
+    def _shelf_context(self):
+        """书架后台扫描需要的活数据（在主线程取；书架自己拷贝快照再交给线程）。"""
+        return {"library_dirs": self.cfg.get("library_dirs", []), "recent": self.cfg.get("recent", []),
+                "bookmarks": self.bookmarks}
+
+    def _shelf_visible(self):
+        return self.stack.currentWidget() is self.shelf
+
+    def _sync_page_state(self):
+        """按当前页刷新：书架按钮勾选、依赖阅读页的动作 / 搜索框可用性、窗口标题。"""
+        on_shelf = self._shelf_visible()
+        self.shelf_act.setChecked(on_shelf)
+        for a in self._reader_acts:
+            a.setEnabled(not on_shelf)
+        for w in self._reader_widgets:
+            w.setEnabled(not on_shelf)
+        if not on_shelf:
+            self._update_tts_actions()    # stop_act 的可用性取决于朗读状态，不能一律启用
+        title = self.windowTitle()
+        if on_shelf:
+            if title != "书架 — PyReader":
+                self._reader_title = title
+            self.setWindowTitle("书架 — PyReader")
+        elif title == "书架 — PyReader":
+            self.setWindowTitle(self._reader_title)
+
+    def show_shelf(self):
+        if self._shelf_visible():
+            return
+        self._save_progress(force=False)  # 离开阅读页前存一次进度：书架上看到的进度是最新的
+        self.stack.setCurrentIndex(0)
+        self._sync_page_state()
+
+    def show_reader(self):
+        """切到阅读页。必须发生在启动 loader 之前：pagination_params 用阅读页的 height()，
+        QStackedLayout 只给当前页设置几何，隐藏的页尺寸可能是旧的（或从未显示过的默认值）。"""
+        if not self._shelf_visible():
+            return
+        self.stack.setCurrentIndex(1)
+        self._sync_page_state()
+        if self._resized_on_shelf and self.pager:
+            self._resized_on_shelf = False
+            self._resize_timer.start()    # 书架期间窗口大小变过：按新尺寸重排
+
+    def _on_shelf_act(self, checked):
+        if checked:
+            self.show_shelf()
+        elif self.book_path:
+            self.show_reader()
+        else:
+            self.shelf_act.setChecked(True)   # 没有可返回的书：留在书架
+
+    def _open_from_shelf(self, path):
+        """书架双击 / 回车：先切页再加载（load_book 内部保证）；加载失败则回书架。"""
+        self.load_book(path)
+        self._shelf_open_pending = True
+
+    def _on_progress_tick(self):
+        """30 秒进度计时器：书架可见且阅读位置没变时什么都不做。"""
+        if self._shelf_visible() and self.view.left_page_offset() == self._last_saved_offset:
+            return
+        self._save_progress(force=False)
 
     def _build_menus(self):
         self.toc.itemClicked.connect(lambda it: self.goto_offset(it.data(Qt.ItemDataRole.UserRole)))
@@ -428,6 +524,7 @@ class MainWindow(QMainWindow):
             save_json(BOOKMARKS_PATH, self.bookmarks)
         except Exception:
             pass
+        self.shelf.note_progress(self.book_path, rec["percent"], rec["updated"], rec["device"])
         return self.sync.push(self.cfg, rec)
 
     def _on_remote_progress(self, book_path, remote):
@@ -456,6 +553,7 @@ class MainWindow(QMainWindow):
             save_json(BOOKMARKS_PATH, self.bookmarks)
         except Exception:
             pass
+        self.shelf.note_progress(self.book_path, remote.get("percent", 0), remote.get("updated"), remote.get("device", ""))
         self.statusBar().showMessage(
             f"☁️ 已同步进度（来自 {remote.get('device', '?')}，{remote.get('percent', 0):.1f}%）", 6000)
 
@@ -469,10 +567,12 @@ class MainWindow(QMainWindow):
             dirs.append(d)
             self.cfg["library_dirs"] = dirs
             save_json(CONFIG_PATH, self.cfg)
+            self.shelf.rescan(force=True)
 
     def _remove_library_dir(self, d):
         self.cfg["library_dirs"] = [x for x in self.cfg.get("library_dirs", []) if x != d]
         save_json(CONFIG_PATH, self.cfg)
+        self.shelf.rescan(force=True)
 
     def open_book(self):
         libs = self.cfg.get("library_dirs", [])
@@ -484,6 +584,9 @@ class MainWindow(QMainWindow):
             self.load_book(path)
 
     def load_book(self, path):
+        self.show_reader()                   # 先切到阅读页，再启动 loader（几何见 show_reader 的说明）
+        self._shelf_open_pending = False
+        self.shelf.note_opened(path)
         self._tts_stop()
         self._save_progress(force=True)      # 切书前先存当前书的进度
         self._loaded_path = None
@@ -506,9 +609,15 @@ class MainWindow(QMainWindow):
     def _on_load_failed(self, msg):
         self.load_bar.hide()
         QMessageBox.critical(self, "错误", msg)
+        if self._shelf_open_pending:         # 从书架打开却失败：回书架，而不是停在空白阅读页
+            self._shelf_open_pending = False
+            self.show_shelf()
 
     def _on_book_loaded(self, text, chapters, title="", extra=None):
         self.load_bar.hide()
+        self._shelf_open_pending = False
+        if self._shelf_visible():            # 加载期间用户切回了书架：阅读页尺寸可能是旧的，回来时重排
+            self._resized_on_shelf = True
         self.full_text = text
         self.view.set_layout(self._make_layout())
         extra = extra if isinstance(extra, dict) else {}
@@ -613,7 +722,10 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, e):
         super().resizeEvent(e)
         if self.pager:
-            self._resize_timer.start()      # 200ms 内只重排一次
+            if self._shelf_visible():
+                self._resized_on_shelf = True   # 隐藏的阅读页拿不到新尺寸：回到阅读页再重排
+            else:
+                self._resize_timer.start()      # 200ms 内只重排一次
 
     # ---- 目录 / 书签 ----
     def _build_toc(self):
@@ -724,6 +836,8 @@ class MainWindow(QMainWindow):
     def open_settings(self):
         dlg = SettingsDialog(self.cfg, self)
         if dlg.exec():
+            old_shelf = (self.cfg.get("shelf_default_view"), self.cfg.get("shelf_default_sort"),
+                         bool(self.cfg.get("shelf_start_in_shelf", False)))
             self.set_single_page(dlg.single_page.isChecked())
             self.cfg.update({
                 "api_key": dlg.key.text().strip(), "api_base": dlg.base.text().strip(),
@@ -750,8 +864,19 @@ class MainWindow(QMainWindow):
                 "webdav_password": dlg.webdav_password.text(),
                 "sync_user_name": dlg.sync_user_name.text().strip() or "default",
                 "device_name": dlg.device_name.text().strip() or syncmod.default_device_name(),
+                "shelf_default_view": dlg.shelf_view.currentData(),
+                "shelf_default_sort": dlg.shelf_sort.currentData(),
+                "shelf_start_in_shelf": dlg.shelf_start.isChecked(),
             })
             save_json(CONFIG_PATH, self.cfg)
+            new_shelf = (self.cfg["shelf_default_view"], self.cfg["shelf_default_sort"], self.cfg["shelf_start_in_shelf"])
+            if dlg.shelf_reset.isChecked() and QMessageBox.question(
+                    self, "重置书架状态",
+                    "将重置书架的界面偏好，并清除索引缓存（含本机记录的阅读百分比和打开时间）。\n"
+                    "不会删除书，也不会动阅读书签 / 进度。继续吗？") == QMessageBox.StandardButton.Yes:
+                self.shelf.reset_state(*new_shelf)
+            elif new_shelf != old_shelf:
+                self.shelf.apply_defaults(*new_shelf)
             set_net_proxy(self.cfg["proxy"])
             set_azure_config(self.cfg["azure_tts_key"], self.cfg["azure_tts_region"],
                          self.cfg["azure_tts_key2"], self.cfg["azure_tts_region2"])
@@ -1285,6 +1410,8 @@ class MainWindow(QMainWindow):
             self.tts_act.setText("▶ 继续朗读"); self.stop_act.setEnabled(True)
         else:
             self.tts_act.setText("🔊 朗读"); self.stop_act.setEnabled(False)
+        if self._shelf_visible():
+            self.stop_act.setEnabled(False)     # 书架可见：依赖阅读页的动作一律禁用
 
     def _reveal_offset(self, off):
         if not self.pager:
@@ -1486,7 +1613,24 @@ class MainWindow(QMainWindow):
         self._update_status()
 
     def keyPressEvent(self, e):
-        if e.key() == Qt.Key.Key_F and (e.modifiers() & Qt.KeyboardModifier.ControlModifier):
+        ctrl = bool(e.modifiers() & Qt.KeyboardModifier.ControlModifier)
+        if self._shelf_visible():
+            # 书架可见：翻页键 / F3 绝不传给隐藏的阅读页（否则会翻页、触发 pageChanged 与进度推送）；Ctrl+F 聚焦书架自己的搜索框
+            if e.key() == Qt.Key.Key_F and ctrl:
+                self.shelf.focus_search()
+                return
+            if e.key() == Qt.Key.Key_Escape and self.shelf.handle_escape():
+                return
+            if e.key() in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_PageUp, Qt.Key.Key_PageDown,
+                           Qt.Key.Key_Space, Qt.Key.Key_F3):
+                e.accept()
+                return
+            super().keyPressEvent(e)
+            return
+        if e.key() == Qt.Key.Key_Escape and not (e.modifiers() & ~Qt.KeyboardModifier.KeypadModifier):
+            self.show_shelf()                # 阅读页 Esc → 书架
+            return
+        if e.key() == Qt.Key.Key_F and ctrl:
             self.search_box.setFocus(); self.search_box.selectAll(); return
         if e.key() == Qt.Key.Key_F3:
             if e.modifiers() & Qt.KeyboardModifier.ShiftModifier:
@@ -1514,4 +1658,5 @@ class MainWindow(QMainWindow):
                 save_json(BOOKMARKS_PATH, self.bookmarks)
         if t is not None:
             t.join(3)   # 给远端推送一点时间（daemon 线程不会阻止退出）
+        self.shelf.flush()
         super().closeEvent(e)
