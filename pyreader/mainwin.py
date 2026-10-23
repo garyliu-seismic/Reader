@@ -1,6 +1,7 @@
 import os
 import re
 import threading
+import time as _time
 from typing import Optional
 from PySide6.QtCore import Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QFont, QPixmap, QPainter, QColor, QIcon, QDesktopServices, QKeySequence
@@ -136,9 +137,16 @@ class MainWindow(QMainWindow):
         rv.addWidget(self.ai_tabs)
 
         # 中央控件：QStackedWidget。第 0 页书架（ShelfView），第 1 页现有阅读页（self.view，属性名不变）。
+        # 单实例锁（design §4.5）：~/.pyreader/shelf/.lock 的 OS 级独占锁。取不到（另一个 pyreader 进程在用书架）就以只读模式
+        # 打开书架：可浏览，但不写 overlay.json / state.json / 设备文件，状态条提示。锁随进程退出自动释放。
+        try:
+            self._shelf_lock = shelfmod.acquire_lock()
+        except Exception:
+            self._shelf_lock = None
         self.shelf = ShelfView(self._shelf_context,
                                default_view=self.cfg.get("shelf_default_view", "grid"),
-                               default_sort=self.cfg.get("shelf_default_sort", "last_read"))
+                               default_sort=self.cfg.get("shelf_default_sort", "last_read"),
+                               read_only=self._shelf_lock is None)
         self.shelf.openRequested.connect(self._open_from_shelf)
         self.shelf.addLibraryRequested.connect(self._add_library_dir)
         self.stack = QStackedWidget()
@@ -901,7 +909,9 @@ class MainWindow(QMainWindow):
             new_shelf = (self.cfg["shelf_default_view"], self.cfg["shelf_default_sort"], self.cfg["shelf_start_in_shelf"])
             if dlg.shelf_reset.isChecked() and QMessageBox.question(
                     self, "重置书架状态",
-                    "将重置书架的界面偏好，并清除索引缓存（含本机记录的阅读百分比和打开时间）。\n"
+                    "将重置书架的界面偏好，清除索引缓存（含本机记录的阅读百分比和打开时间），\n"
+                    "并清空本设备的收藏 / 隐藏 / 进度摘要（本机 overlay.json 与其它设备文件的缓存；\n"
+                    "启用云同步时，云端本设备的设备文件也会被清空）。其它设备的状态不受影响。\n"
                     "不会删除书，也不会动阅读书签 / 进度。继续吗？") == QMessageBox.StandardButton.Yes:
                 self.shelf.reset_state(*new_shelf)
             elif new_shelf != old_shelf:
@@ -1675,6 +1685,7 @@ class MainWindow(QMainWindow):
             super().keyPressEvent(e)
 
     def closeEvent(self, e):
+        _t0 = _time.monotonic()
         self.tts_on = False
         if self.player:
             self.player.stop()
@@ -1687,5 +1698,9 @@ class MainWindow(QMainWindow):
                 save_json(BOOKMARKS_PATH, self.bookmarks)
         if t is not None:
             t.join(3)   # 给远端推送一点时间（daemon 线程不会阻止退出）
+        # 有未推送的收藏 / 隐藏 / 进度摘要就有界地推一次：与上面的阅读进度推送合计最多等 3 秒（各只 join 一次）
+        self.shelf.flush_cloud(max(0.3, 3.0 - (_time.monotonic() - _t0)))
         self.shelf.flush()
+        if self._shelf_lock is not None:
+            self._shelf_lock.release()
         super().closeEvent(e)

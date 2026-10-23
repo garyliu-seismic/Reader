@@ -104,7 +104,9 @@ class SettingsDialog(QDialog):
         self.shelf_start.setToolTip("不勾选时：有最近阅读的书则进入阅读页，否则显示书架")
         self.shelf_reset = QCheckBox("点「确定」时重置书架状态")
         self.shelf_reset.setChecked(False)
-        self.shelf_reset.setToolTip("重置书架的界面偏好与索引缓存（含本机记录的阅读百分比和打开时间）。不删除书，也不动阅读书签 / 进度。")
+        self.shelf_reset.setToolTip("重置书架的界面偏好与索引缓存（含本机记录的阅读百分比和打开时间），并清空本设备的收藏 / 隐藏 / 进度摘要"
+                                    "（启用云同步时，云端本设备的设备文件也会被清空；其它设备的状态不受影响）。"
+                                    "不删除书，也不动阅读书签 / 进度。")
         # 双语朗读（朗读时 AI 翻译）
         self.bilingual = QCheckBox("朗读时自动翻译并显示")
         self.bilingual.setChecked(bool(cfg.get("bilingual", False)))

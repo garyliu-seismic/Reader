@@ -1,5 +1,7 @@
 """阶段 2 / 3 / 4：书架界面（阶段 3 起云端书库并入：后台列 library/、角标、带 token 的下载后打开；
-阶段 4 起：设备文件的进度摘要写入与读取、进度条 / 最近阅读 / 在读 / 已读完、「继续阅读」条、手动上传对话框）。设计见 c:\\tmp\\pyreader-bookshelf-design.md §6、§7 阶段 2。
+阶段 4 起：设备文件的进度摘要写入与读取、进度条 / 最近阅读 / 在读 / 已读完、「继续阅读」条、手动上传对话框；
+阶段 5 起：收藏 / 隐藏（右键菜单、智能书架「收藏」）、合并其它设备的覆盖层、自愈推送、只读实例、重置、关闭时的有界 flush）。
+设计见 c:\\tmp\\pyreader-bookshelf-design.md §6、§7 阶段 2。
 
 结构：
   - ScanWorker  后台线程：scan_local + build_books（纯逻辑，不碰 Qt 对象），结果经 Signal 回主线程
@@ -16,7 +18,8 @@ import threading
 import time
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
-from PySide6.QtCore import (QAbstractTableModel, QModelIndex, QObject, QRect, QSize, Qt, QTimer, QUrl, Signal)
+from PySide6.QtCore import (QAbstractTableModel, QCoreApplication, QModelIndex, QObject, QRect, QSize, Qt, QTimer, QUrl,
+                            Signal)
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontMetrics, QGuiApplication, QPainter, QPen
 from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QHBoxLayout, QHeaderView,
                                QInputDialog, QLabel, QLineEdit, QListView, QListWidget, QListWidgetItem, QMenu,
@@ -27,10 +30,10 @@ from . import shelf as sh
 from . import shelfsync as ss
 from .webdav import client_from_cfg
 
-SMART = (("all", "全部"), ("recent", "最近阅读"), ("reading", "在读"), ("done", "已读完"))   # 阶段 2 的智能书架
+SMART = (("all", "全部"), ("recent", "最近阅读"), ("reading", "在读"), ("done", "已读完"), ("fav", "收藏"))   # 智能书架
 SORT_LABELS = (("last_read", "最近阅读"), ("title", "书名"), ("added", "最近添加"), ("progress", "进度"), ("size", "大小"))
 COLUMNS = ("书名", "格式", "进度", "最近阅读", "大小", "位置")
-CLOUD_SMART = (("uncategorized", "未分类"), ("removed", "云端已移除"))     # 有书时才出现在侧栏
+CLOUD_SMART = (("uncategorized", "未分类"), ("removed", "云端已移除"), ("hidden", "我隐藏的"))     # 有书时才出现在侧栏
 CLOUD_TIMER_MS = 10 * 60 * 1000      # 书架可见期间每 10 分钟刷新一次云端列表
 CLOUD_STALE_SECONDS = 60             # 打开书架视图时，距上次云端刷新不足这个秒数则不重复
 BADGES = {"cloud": "仅云端", "synced": "已下载", "local": "仅本地", "removed": "云端已移除"}
@@ -40,12 +43,14 @@ COVER_W, COVER_H = 116, 160
 PUSH_DEBOUNCE_MS = 5000              # 进度摘要：阅读事件之后等这么久再推送（合并连续的事件）
 PUSH_MIN_INTERVAL_MS = 60 * 1000     # 两次推送设备文件之间至少隔这么久（设备文件最多约 300KB，读书时不必每 30 秒推一次）
 OVERLAY_SAVE_MS = 5000               # overlay.json 防抖
-CONFIRM_TEXT = ("要把你的阅读进度同步到云端吗？\n\n"
+SKEW_NOTICE_MS = 2 * 60 * 1000       # 本机时钟与服务器 Date 头相差超过这么久才提示 / 才修正时间戳（Date 只有秒级精度）
+CONFIRM_TEXT = ("要把你的书架状态同步到云端吗？\n\n"
                 "会上传到你的云端用户目录（users/<用户名>/shelf/）的内容：\n"
-                "  · 最近读过的书的书名标识和阅读进度（百分比、时间）\n"
+                "  · 书名、收藏、隐藏标记\n"
+                "  · 最近读过的书及其阅读进度（百分比、时间）\n"
                 "  · 本设备的名称\n"
                 "不会上传：本机文件路径、账号密码、任何设置。\n\n"
-                "之后读书时会自动更新这份进度（不会上传任何书）。")
+                "之后你的修改和读书进度会自动同步（不会上传任何书）。")
 
 
 # ================================================================== 小工具（纯函数，便于测试）
@@ -105,6 +110,11 @@ def badge_text(b: sh.Book, busy: bool = False) -> str:
     return BADGES.get(b.where, "")
 
 
+def flags_text(b: sh.Book, cloud: bool = True) -> str:
+    """列表「位置」列里的小记号：★ 收藏；● 有还没推送到云端的本地修改（仅启用云同步时）。"""
+    return (" ★" if b.fav else "") + (" ●" if (b.unpushed and cloud) else "")
+
+
 def continue_text(b: sh.Book, local_names=(), now: Optional[float] = None) -> str:
     """「继续阅读」条的一行文字：继续阅读：《三体》  在 gary-phone 上读到 37%（3 小时前）。纯文本（调用方用 PlainText 显示）。"""
     dev = (b.progress_device or "").strip()
@@ -125,13 +135,18 @@ def suggest_name(name: str) -> str:
 def count_shelves(books) -> Dict[str, int]:
     """一次遍历得到侧栏所有计数：智能书架 + 每个文件夹书架（与 filter_books 的可见性规则一致）。
     removed（云端已移除）含默认隐藏的；uncategorized 是云端根目录的书。"""
-    out: Dict[str, int] = {"all": 0, "recent": 0, "reading": 0, "done": 0, "removed": 0, "uncategorized": 0}
+    out: Dict[str, int] = {"all": 0, "recent": 0, "reading": 0, "done": 0, "removed": 0, "uncategorized": 0,
+                           "fav": 0, "hidden": 0}
     for b in (books.values() if isinstance(books, dict) else books):
         if b.removed and not b.hidden:
             out["removed"] += 1
+        if b.hidden:
+            out["hidden"] += 1
         if b.hidden or b.auto_hidden:
             continue
         out["all"] += 1
+        if b.fav:
+            out["fav"] += 1
         if b.shelf == sh.CLOUD:
             out["uncategorized"] += 1
         if b.last_read > 0:
@@ -158,14 +173,16 @@ class ScanWorker(QObject):
     failed = Signal(int, str)
 
     def __init__(self, token: int, roots: List[str], bookmarks: dict, recent: List[str], progress: dict, opened: dict,
-                 remote_files=None, removed=(), removed_files=(), files=None):
-        """remote_files 为 None = 云端未启用 / 列表未知。files 不为 None 时复用上一轮的本地文件（不再遍历磁盘）。"""
+                 remote_files=None, removed=(), removed_files=(), files=None, entries=None):
+        """remote_files 为 None = 云端未启用 / 列表未知。files 不为 None 时复用上一轮的本地文件（不再遍历磁盘）。
+        entries：覆盖层合并视图的条目（fav / hidden / meta），主线程算好后的快照。"""
         super().__init__()
         self.token = token
         self.roots, self.bookmarks, self.recent = roots, bookmarks, recent
         self.progress, self.opened = progress, opened
         self.remote_files, self.removed, self.removed_files = remote_files, set(removed or ()), list(removed_files or ())
         self.files = files
+        self.entries = entries or {}
         self._stop = threading.Event()
 
     def stop(self):
@@ -177,7 +194,7 @@ class ScanWorker(QObject):
             files = sh.scan_local(self.roots, should_stop=self._stop.is_set) if scanned else self.files
             if self._stop.is_set():
                 return
-            books = sh.build_books(files, self.remote_files, sh.progress_overlay(self.progress), bookmarks=self.bookmarks,
+            books = sh.build_books(files, self.remote_files, sh.progress_overlay(self.progress, self.entries), bookmarks=self.bookmarks,
                                    recent=self.recent, opened=self.opened, removed=self.removed,
                                    removed_files=self.removed_files)
             if self._stop.is_set():
@@ -253,7 +270,7 @@ class BookModel(QAbstractTableModel):
             if c == 4:
                 return fmt_size(b.size)
             if c == 5:
-                return self.badge(b)
+                return (self.badge(b) + flags_text(b, self.show_badges)).strip()
         elif role == Qt.ItemDataRole.ToolTipRole:
             if b.local_paths:
                 return plain_tip(b.local_paths[0])
@@ -313,6 +330,19 @@ class BookDelegate(QStyledItemDelegate):
             p.setFont(bf)
             p.setPen(QColor("#ffffff"))
             p.drawText(pill, int(Qt.AlignmentFlag.AlignCenter), bt)
+        if b.fav or b.unpushed:                           # 左上角：★ 收藏；● 橙点 = 有未推送的本地修改
+            x = cover.left() + 12
+            if b.fav:
+                sf = QFont(option.font)
+                sf.setPixelSize(16)
+                p.setFont(sf)
+                p.setPen(QColor("#ffd54a"))
+                p.drawText(QRect(x, cover.top() + 4, 18, 18), int(Qt.AlignmentFlag.AlignCenter), "★")
+                x += 20
+            if b.unpushed and getattr(m, "show_badges", False):
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor("#ff8c1a"))
+                p.drawEllipse(QRect(x, cover.top() + 8, 9, 9))
         if b.percent is not None:                         # 封面底部的进度条
             track = QRect(cover.left() + 12, cover.bottom() - 10, cover.width() - 20, 4)
             p.setPen(Qt.PenStyle.NoPen)
@@ -459,13 +489,16 @@ class ShelfView(QWidget):
 
     def __init__(self, context: Optional[Callable[[], dict]] = None, root: Optional[str] = None,
                  default_view: str = "grid", default_sort: str = "last_read", parent=None,
-                 cloud: Optional[ss.ShelfSyncWorker] = None):
+                 cloud: Optional[ss.ShelfSyncWorker] = None, read_only: bool = False):
         """context() 在主线程调用，返回 {"library_dirs": [...], "recent": [...], "bookmarks": {...}, "cfg": {...}}
         （引用 MainWindow 的活数据；cfg 里的 webdav_* 决定云端是否启用）。
-        root：书架数据根（默认 ~/.pyreader，测试传临时目录）。cloud：云端后台任务（测试可注入）。"""
+        root：书架数据根（默认 ~/.pyreader，测试传临时目录）。cloud：云端后台任务（测试可注入）。
+        read_only：没拿到单实例锁（另一个 pyreader 进程在用书架）——可浏览，但不写 overlay.json / state.json、
+        不写设备文件、不能改收藏 / 隐藏（design §4.5）。"""
         super().__init__(parent)
         self._context = context or (lambda: {})
         self._root = root
+        self._read_only = bool(read_only)
         self._books: Dict[str, sh.Book] = {}
         self._opened: Dict[str, float] = {}
         self._progress: Dict[str, dict] = {}
@@ -484,14 +517,21 @@ class ShelfView(QWidget):
         self._cloud.downloadFailed.connect(self._on_download_failed, Qt.ConnectionType.QueuedConnection)
         self._cloud.progressPulled.connect(self._on_progress_pulled, Qt.ConnectionType.QueuedConnection)
         self._cloud.progressFailed.connect(self._on_progress_failed, Qt.ConnectionType.QueuedConnection)
-        self._cloud.pushed.connect(self._on_pushed, Qt.ConnectionType.QueuedConnection)
+        self._cloud.pushed.connect(self._on_pushed, Qt.ConnectionType.QueuedConnection)   # (rev, hash, etag, 戳)
         self._cloud.pushFailed.connect(self._on_push_failed, Qt.ConnectionType.QueuedConnection)
         self._cloud.uploadDone.connect(self._on_upload_done, Qt.ConnectionType.QueuedConnection)
         # ---- 阶段 4：进度摘要 / 推送 / 上传。下面三个可调用对象供测试替换（默认弹真实对话框）
         self.confirm_push: Callable[[], Optional[bool]] = self._default_confirm_push     # True 同意 / False 拒绝 / None 现在不问
         self.upload_chooser: Callable = self._default_upload_chooser                     # (items, folders) -> (folder, [(path, name)]) | None
         self.rename_chooser: Callable = self._default_rename_chooser                     # (name, folder, message) -> 新文件名 | None
-        self._overlay: Optional[dict] = None          # 本设备的覆盖层（阶段 4 只用其中的 progress 摘要）；主线程独占
+        self.run_menu: Callable = lambda menu, global_pos: menu.exec(global_pos)         # 右键菜单怎么弹出（测试替换成直接选动作）
+        self._overlay: Optional[dict] = None          # 本设备的覆盖层（fav / hidden / meta + progress 摘要）；主线程独占，可写
+        self._disk_ov: Optional[dict] = None          # 只用来显示的覆盖层（读盘一次，不创建文件）；_overlay 建立后不再用
+        self._merged: Optional[dict] = None           # 本设备 + 其它设备合并后的视图缓存（编辑 / peers 变化后置 None）
+        self._unpushed: Dict[str, int] = {}           # 本设备改过、还没推送的 book_id -> 修改时的 rev（橙点）
+        self._heal = False                            # 自愈：云端自己的设备文件落后 / 缺失 / 损坏，需要重推（即使内容哈希没变）
+        self._reset_floor_rev = 0                     # 重置后产生的 rev 下限：更早发出的推送完成不能清掉 reset_pending
+        self._clock_note = ""                         # 本机时钟与服务器相差较大时的提示
         self._overlay_dirty = False
         self._push_declined = False                   # 本次会话用户拒绝了首次上传确认
         self._push_inflight: Optional[tuple] = None   # (rev, hash)
@@ -525,7 +565,8 @@ class ShelfView(QWidget):
             if default_sort in sh.SORT_KEYS:
                 ui["sort"] = default_sort
             try:
-                sh.save_state(self._state, root)      # 立刻固定下来：以后 config 默认值只在设置页改动时才再应用
+                if not self._read_only:
+                    sh.save_state(self._state, root)      # 立刻固定下来：以后 config 默认值只在设置页改动时才再应用
             except OSError:
                 pass
         self._want_shelf = ui.get("last_shelf") or "all"
@@ -540,6 +581,8 @@ class ShelfView(QWidget):
         self._catalog = ss.CloudCatalog(ss.known_from_books(self._books.values()), self._state["cloud"]["missing"])
         self._peers = ss.load_cached_peers(root)           # 离线冷启动也能显示其它设备读到哪了
         self._merge_progress(ss.digest_progress(self._peers))
+        self._unpushed = {bid: 0 for bid in self._state.get("unpushed", [])}
+        self._decorate_books()                             # 缓存的书先套上收藏 / 隐藏 / 橙点（扫描完成后由 build_books 再算一遍）
         self._build_ui()
         self._cloud_timer = QTimer(self)
         self._cloud_timer.setInterval(CLOUD_TIMER_MS)
@@ -610,7 +653,7 @@ class ShelfView(QWidget):
         for v in (self.grid, self.table):
             v.setModel(self.model)
             v.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-            v.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+            v.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)     # 右键菜单支持多选
             v.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             v.customContextMenuRequested.connect(lambda pos, v=v: self._show_menu(v, pos))
             v.activated.connect(self._on_activated)       # 双击 / 回车
@@ -687,6 +730,9 @@ class ShelfView(QWidget):
         return self.model.books()
 
     def _save_ui(self):
+        if self._read_only:
+            return                                # 没有锁的实例不写 state.json（避免和持锁实例互相覆盖）
+        self._state["unpushed"] = sorted(self._unpushed)[:sh.MAX_UNPUSHED]
         try:
             sh.save_state(self._state, self._root)
         except OSError:
@@ -746,9 +792,46 @@ class ShelfView(QWidget):
         self.set_sort(sort, save=False)
         self._save_ui()
 
+    def reset_cloud_state(self):
+        """「重置书架状态」的覆盖层部分（design §4.7）：截断本地 overlay.json、清空 peers/ 与游标 / 推送记录，
+        并（曾经向云端写过的话）登记 reset_pending —— 之后第一件事是把空的设备文件 PUT 上去覆盖云端旧内容。
+        reset_pending 期间不会采纳云端自己的旧文件（见 _check_own），所以旧状态 / 旧缓存不会被「自愈」复活。
+        只读实例不能重置。device_id 保持不变。"""
+        if self._read_only:
+            self._notice = "只读：另一个 pyreader 窗口正在使用书架，不能重置书架状态"
+            return False
+        self._overlay_timer.stop()
+        self._push_timer.stop()
+        self._index_timer.stop()
+        ov_file = os.path.exists(sh.overlay_path(self._root))
+        had_remote = bool(self._state.get("confirmed_upload"))
+        ov = self._ensure_overlay() if (ov_file or self._overlay is not None or had_remote) else None
+        if ov is not None:
+            sh.reset_overlay(ov)
+            self._reset_floor_rev = int(ov.get("_rev", 0))
+            self._overlay_dirty = True
+        else:
+            self._overlay = None
+            self._disk_ov = None
+            self._reset_floor_rev = 0
+        self._save_overlay()
+        sh.clear_peers(self._root)
+        self._peers = {}
+        self._unpushed.clear()
+        self._heal = False
+        self._push_inflight = None
+        st = self._state
+        st["cursors"] = {"peers": {}, "rounds_since_full": 0}
+        st["remote_stamp"], st["pushed_hash"], st["pushed_rev"], st["unpushed"] = None, "", 0, []
+        st["reset_pending"] = had_remote
+        self._cloud.forget_cursors()
+        self._invalidate_merged()
+        self._decorate_books()
+        return True
+
     def reset_state(self, default_view: str, default_sort: str, start_in_shelf: bool = False):
-        """设置页「重置书架状态」（阶段 2：仅本机界面偏好 + index.json 缓存；
-        overlay.json / peers/ / 远端设备文件的重置属于阶段 5，此处不碰）。device_id 保持不变。"""
+        """设置页「重置书架状态」：本机界面偏好 + index.json 缓存 + 本设备覆盖层（overlay.json、peers/、游标，
+        并把空设备文件推上云端，见 reset_cloud_state）。device_id 保持不变。"""
         ui = dict(sh.DEFAULT_UI, collapsed=[])
         if default_view in ("grid", "list"):
             ui["view"] = default_view
@@ -756,6 +839,7 @@ class ShelfView(QWidget):
             ui["sort"] = default_sort
         ui["start_in_shelf"] = bool(start_in_shelf)
         self._state["ui"] = ui
+        self.reset_cloud_state()                  # 先清覆盖层 / peers / 游标并登记 reset_pending，再统一落盘 state.json
         self._save_ui()
         if not self._index_readonly:
             sh.reset_index(self._root)
@@ -772,6 +856,7 @@ class ShelfView(QWidget):
         self.refresh()
         self.rescan(force=True)
         self.sync_cloud(force=True)
+        self.maybe_push()                         # 把空设备文件推上去（云端不可达就留着 reset_pending，联网后第一件事就是推）
 
     # ------------------------------------------------------------ 过滤 / 刷新
     def refresh(self):
@@ -931,6 +1016,13 @@ class ShelfView(QWidget):
             parts.append(f"书库超过 {sh.SCAN_LIMIT} 本，只显示前 {sh.SCAN_LIMIT} 本")
         if self._scan_error:
             parts.append("扫描失败：" + self._scan_error)
+        if self._read_only:
+            parts.append("只读：另一个 pyreader 窗口正在使用书架（本窗口不保存收藏 / 隐藏，也不同步）")
+        if self._clock_note:
+            parts.append("⚠ " + self._clock_note)
+        bad = self.clock_anomalies()
+        if bad:
+            parts.append("⚠ 设备 " + "、".join(bad[:3]) + " 的时钟异常（超前一天以上），它的收藏 / 隐藏改动已按最旧处理")
         if self._notice:
             parts.append(self._notice)
         self.status.setText(" · ".join(parts))
@@ -966,7 +1058,7 @@ class ShelfView(QWidget):
             self._scanner.stop()
         self._token += 1
         w = ScanWorker(self._token, roots, snap, recent, dict(self._progress), dict(self._opened),
-                       remote_files, removed, removed_files, files)
+                       remote_files, removed, removed_files, files, self.merged_view().get("entries"))
         w.done.connect(self._on_scan_done, Qt.ConnectionType.QueuedConnection)
         w.failed.connect(self._on_scan_failed, Qt.ConnectionType.QueuedConnection)
         self._scanner = w
@@ -996,6 +1088,7 @@ class ShelfView(QWidget):
             b = self._books.get(bid)
             if b:
                 sh.note_progress(b, rec["percent"], rec["updated"], rec.get("device", ""))
+        self._decorate_books()
         self.refresh()
         self._schedule_index_save()
         self.scanFinished.emit(len(self._books))
@@ -1047,8 +1140,9 @@ class ShelfView(QWidget):
             s += " · 正在读取其它设备的进度…"
         elif self._progress_error:
             s += f" · 进度同步失败：{self._progress_error}"
-        if self.push_pending():
-            s += " · 阅读进度待上传" + (f"（{self._push_error}）" if self._push_error else "")
+        n = self.pending_count()
+        if n:
+            s += (f" · {n} 项待同步" if n > 0 else " · 有改动待同步") + (f"（{self._push_error}）" if self._push_error else "")
         return s
 
     def sync_cloud_if_stale(self) -> bool:
@@ -1208,22 +1302,154 @@ class ShelfView(QWidget):
             self._index_dirty = True
 
     def flush(self):
-        """关闭窗口 / 退出前：立刻落盘未保存的索引与 UI 状态。"""
+        """关闭窗口 / 退出前：立刻落盘未保存的索引、覆盖层与 UI 状态。"""
         self._save_index()
         self._save_overlay()
         self._save_ui()
+
+    def flush_cloud(self, timeout: float = 3.0) -> bool:
+        """关闭窗口时的有界 flush（design §4.2）：本设备覆盖层有未推送的改动、且用户之前已确认过上传，就在后台线程推一次，
+        最多等 timeout 秒（只 join 一次）。这里绝不弹确认框；没确认过 / 只读 / 未启用云同步 / 没有待推送内容都是空操作。
+        返回是否已无待推送内容。"""
+        if self._read_only or not self.cloud_enabled() or not self._state.get("confirmed_upload"):
+            return True
+        self._overlay_timer.stop()
+        self._push_timer.stop()
+        if self.push_pending():
+            self.maybe_push()
+            self._cloud.join_push(timeout)
+            QCoreApplication.processEvents()      # 投递排队中的 pushed 信号：把 pushed_hash / remote_stamp 记下来
+        self.flush()
+        return not self.push_pending()
 
     # ------------------------------------------------------------ 进度摘要（阶段 4）：本设备写、其它设备读
     def _sync_user(self) -> str:
         return self._cfg().get("sync_user_name") or "default"
 
     def _ensure_overlay(self) -> Optional[dict]:
-        """本设备覆盖层（懒加载，主线程独占）。同步用户名不合法 / 更高主版本的只读文件 -> None。"""
-        if ss.check_user(self._sync_user()) is None:
+        """本设备覆盖层（懒加载，主线程独占，可写）。只读实例 / 启用云同步但用户名不合法 / 更高主版本的只读文件 -> None。
+        未启用云同步时也可用（收藏 / 隐藏只存本机 overlay.json，不发任何请求）。"""
+        if self._read_only:
+            return None
+        if self.cloud_enabled() and ss.check_user(self._sync_user()) is None:
             return None
         if self._overlay is None:
             self._overlay = sh.load_overlay(self._root, self._state["device_id"], user=self._sync_user())
+            self._disk_ov = None
         return None if self._overlay.get("_readonly") else self._overlay
+
+    # ------------------------------------------------------------ 覆盖层视图（本设备 + 其它设备合并）
+    def _own_view(self) -> dict:
+        """用来显示的本设备覆盖层：可写的内存对象优先；还没有就读盘一次（不创建任何文件）。"""
+        if self._overlay is not None:
+            return self._overlay
+        if self._disk_ov is None:
+            try:
+                self._disk_ov = sh.load_overlay(self._root, self._state["device_id"], user=self._sync_user())
+            except Exception:
+                self._disk_ov = sh.new_overlay(self._state["device_id"])
+        return self._disk_ov
+
+    def merged_view(self) -> dict:
+        """本设备覆盖层 + peers/ 里其它设备的覆盖层，按 shelf.merge 合并（校验在 merge 里做）。"""
+        if self._merged is None:
+            try:
+                self._merged = sh.merge(self._own_view(), *[v for _d, v in sorted(self._peers.items())])
+            except Exception:
+                self._merged = {"version": sh.WIRE_VERSION, "_view": True, "entries": {}, "progress": {}, "_clock": []}
+        return self._merged
+
+    def _invalidate_merged(self):
+        self._merged = None
+
+    def _decorate_books(self):
+        """把合并视图里的 fav / hidden 与「未推送」标记就地套到当前的书上（不重建、不碰磁盘）。"""
+        sh.apply_flags(self._books, self.merged_view())
+        for b in self._books.values():
+            b.unpushed = b.id in self._unpushed
+
+    def clock_anomalies(self) -> List[str]:
+        """合并时发现时间戳异常（超前 24 小时以上）的设备。"""
+        return list(self.merged_view().get("_clock") or [])
+
+    def _note_skew(self, ms: int):
+        """可选增强（design §4.6）：服务器 Date 头与本机时钟相差超过 2 分钟才采信，用来修正写入的时间戳并提示用户。"""
+        if abs(ms) >= SKEW_NOTICE_MS:
+            ms = max(-sh.FUTURE_LIMIT_MS, min(sh.FUTURE_LIMIT_MS, int(ms)))
+            self._clock_note = f"本机时钟与服务器相差约 {abs(ms) // 60000} 分钟，请开启系统自动对时"
+        else:
+            ms, self._clock_note = 0, ""
+        if self._state.get("clock_skew_ms") != ms:
+            self._state["clock_skew_ms"] = ms
+            self._save_ui()
+        self._update_status()
+
+    # ------------------------------------------------------------ 收藏 / 隐藏（本设备编辑）
+    @property
+    def read_only(self) -> bool:
+        return self._read_only
+
+    def set_flag(self, books, name: str, value: bool) -> int:
+        """把 books 的 fav / hidden 设为 value（写本设备覆盖层，混合逻辑时钟；立即生效，防抖落盘、防抖推送）。
+        返回实际改动的书数。只读实例 / 用户名不合法时不改，并在状态条提示。绝不创建覆盖层条目以外的东西、不读写书本身。"""
+        if name not in sh.REG_FIELDS:
+            raise ValueError(f"unknown field {name!r}")
+        if self._read_only:
+            self._notice = "只读：另一个 pyreader 窗口正在使用书架，不能修改收藏 / 隐藏"
+            self._update_status()
+            return 0
+        ov = self._ensure_overlay()
+        if ov is None:
+            self._notice = "同步用户名不合法，收藏 / 隐藏无法保存" if self.cloud_enabled() else "书架状态文件不可写，收藏 / 隐藏无法保存"
+            self._update_status()
+            return 0
+        merged = self.merged_view()
+        skew = int(self._state.get("clock_skew_ms") or 0)
+        n = 0
+        cloud = self.cloud_enabled()
+        for b in books:
+            if not isinstance(b, sh.Book) or not sh.valid_book_id(b.id):
+                continue
+            if bool(sh.field_value(merged, b.id, name, False)) == bool(value):
+                continue
+            try:
+                sh.set_field(ov, b.id, name, bool(value), merged=merged, skew_ms=skew, meta=self._meta_for(b))
+            except ValueError:
+                continue                                  # 条目数超限等：跳过这一本
+            if cloud:
+                self._unpushed[b.id] = int(ov.get("_rev", 0))
+            n += 1
+        if not n:
+            return 0
+        self._invalidate_merged()
+        self._decorate_books()
+        self._overlay_dirty = True
+        self._overlay_timer.start()
+        if cloud:
+            self._schedule_push(urgent=True)
+        self.refresh()
+        self._update_status()
+        return n
+
+    @staticmethod
+    def _meta_for(b: sh.Book) -> Optional[dict]:
+        """随编辑一起写进覆盖层的 meta（让别的设备能给这本书画占位卡片）：书名取自文件名，而不是 b.title ——
+        b.title 可能已被别的设备的 meta 覆盖，不能把对端给的字符串原样再当成自己的写出去。只有本地文件名可知的书才写。"""
+        if b.placeholder and not b.remote_rel:
+            return None
+        return {"fp": b.fp, "title": sh._stem(b.filename)}
+
+    def set_fav(self, books, value: bool = True) -> int:
+        return self.set_flag(books, "fav", value)
+
+    def set_hidden(self, books, value: bool = True) -> int:
+        return self.set_flag(books, "hidden", value)
+
+    def pending_count(self) -> int:
+        """「N 项待同步」：本设备改过、还没推送的书数；有待推送内容但不知道是哪些书（重启后丢了标记 / 自愈重推）时返回 -1。"""
+        if not self.push_pending():
+            return 0
+        return len(self._unpushed) or -1
 
     def _merge_progress(self, recs: Dict[str, dict]) -> bool:
         """把别的设备 / 逐书补缺得到的进度并入 self._progress：updated 大者胜（本设备更新的读数不会被旧记录盖掉）。"""
@@ -1243,7 +1469,7 @@ class ShelfView(QWidget):
     def _record_digest(self, bid: str, percent: float, updated: float):
         """本设备读到了哪：写进覆盖层的 progress 摘要（内存，主线程）；防抖落盘 overlay.json、防抖推送设备文件。
         未启用云同步是空操作（不创建任何书架文件）。"""
-        if not self.cloud_enabled():
+        if not self.cloud_enabled() or self._read_only:
             return
         ov = self._ensure_overlay()
         if ov is None:
@@ -1272,9 +1498,14 @@ class ShelfView(QWidget):
             self._overlay_dirty = True
 
     def push_pending(self) -> bool:
-        """本设备的进度摘要有还没上传的内容。"""
+        """本设备覆盖层有还没推送的内容：内容哈希与上次确认推送的不同；或重置后还没把空文件推上去（reset_pending）；
+        或自愈发现云端自己的设备文件落后 / 缺失 / 损坏（_heal）。只读实例 / 未启用云同步永远是 False。"""
+        if self._read_only or not self.cloud_enabled():
+            return False
+        if self._state.get("reset_pending") or self._heal:
+            return self._ensure_overlay() is not None
         ov = self._overlay
-        if ov is None or ov.get("_readonly") or not self.cloud_enabled():
+        if ov is None or ov.get("_readonly"):
             return False
         if not ov.get("progress") and not ov.get("entries") and not self._state.get("pushed_hash"):
             return False                              # 从没写过任何东西：不需要（也不应该）创建空的设备文件
@@ -1283,11 +1514,12 @@ class ShelfView(QWidget):
         except ValueError:
             return False
 
-    def _schedule_push(self):
+    def _schedule_push(self, urgent: bool = False):
+        """防抖推送。阅读进度事件之间至少隔 PUSH_MIN_INTERVAL_MS；用户亲手改的收藏 / 隐藏（urgent）只防抖 5 秒。"""
         if self._push_timer.isActive():
             return
         delay = PUSH_DEBOUNCE_MS
-        if self._last_push is not None:
+        if self._last_push is not None and not urgent:
             delay = max(delay, PUSH_MIN_INTERVAL_MS - int((time.monotonic() - self._last_push) * 1000))
         self._push_timer.start(delay)
 
@@ -1295,7 +1527,7 @@ class ShelfView(QWidget):
         """首次向云端写书架数据前的确认（design §5）。书架不在前台时不打扰（返回 None：以后再问）。"""
         if not self.isVisible():
             return None
-        r = QMessageBox.question(self, "同步阅读进度", CONFIRM_TEXT, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        r = QMessageBox.question(self, "同步书架状态", CONFIRM_TEXT, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                                  QMessageBox.StandardButton.No)
         return r == QMessageBox.StandardButton.Yes
 
@@ -1334,15 +1566,29 @@ class ShelfView(QWidget):
         self._update_status()
         return True
 
-    def _on_pushed(self, rev: int, digest: str, etag: str):
+    def _on_pushed(self, rev: int, digest: str, etag: str, stamp=None):
+        """设备文件已推送（且读回比对通过）。pushed_hash / remote_stamp 记的是「服务器上现在是什么」，永远如实记录；
+        而「本地还有没有待推送的内容」由当前内容哈希与 pushed_hash 的比较决定（pending 判定不依赖 rev）：
+        推送期间发生的新编辑 / 新阅读事件使当前哈希 != 刚推送的哈希，所以仍是待推送，并再排一轮。
+        pushed_rev 与「已推送的书」标记只覆盖 rev <= 发出时 rev 的修改（design §4.3 推送与自愈 2）。"""
         self._push_error = ""
         if self._push_inflight is not None and self._push_inflight[1] == digest:
             self._push_inflight = None                # 先到的旧内容的完成通知不能清掉更新内容的「在途」标记
         self._state["pushed_hash"] = digest
-        self._state["pushed_rev"] = int(rev)
+        if int((self._overlay or {}).get("_rev", 0)) == int(rev):
+            self._state["pushed_rev"] = int(rev)      # 只有当前 rev 仍等于发出时的 rev，才说「到 rev 为止的都推上去了」
+        if isinstance(stamp, dict):
+            self._state["remote_stamp"] = sh._clean_stamp(stamp)
+        for bid in [b for b, r in self._unpushed.items() if r <= int(rev)]:
+            del self._unpushed[bid]                   # 推送期间又改的（rev 更大）保留橙点
+        if int(rev) >= self._reset_floor_rev:
+            self._state["reset_pending"] = False      # 重置之后产生的内容已经推上去了（之前发出的在途推送不算）
+        self._heal = False
+        self._decorate_books()
         self._save_ui()
         if self.push_pending():                       # 推送期间又有新的阅读事件：不能当作已清空，再推一轮
-            self._schedule_push()
+            self._schedule_push(urgent=bool(self._unpushed))
+        self.refresh()
         self._update_status()
 
     def _on_push_failed(self, msg: str):
@@ -1370,28 +1616,69 @@ class ShelfView(QWidget):
         if client_from_cfg(cfg) is None:
             return False
         self._progress_busy = True
+        own = None
+        if not self._read_only:                       # 只读实例完全不碰自己的设备文件
+            ov = self._ensure_overlay()
+            if ov is not None:
+                own = {"stamp": self._state.get("remote_stamp"), "has_content": sh.has_content(ov)}
         self._cloud.sync_progress(cfg, self._root, self._state["device_id"], self._state["cursors"],
-                                  self.progress_wanted(), force_full)
+                                  self.progress_wanted(), force_full, own=own)
         self._update_status()
         return True
+
+    def _check_own(self, own):
+        """自愈（design §4.3）：根据后台对「本设备自己的云端文件」的核对结果决定采纳 / 重推。主线程独占覆盖层，所以在这里做。
+        重置之后（reset_pending）一律不采纳云端旧内容：先把空文件推上去覆盖，旧状态不会复活。"""
+        ov = self._ensure_overlay()
+        if ov is None or own.failed or self._state.get("reset_pending"):
+            return
+        has = sh.has_content(ov)
+        if own.fetched and own.corrupt:
+            self._heal = has                          # 损坏的云端文件：有内容就覆盖修复
+        elif own.fetched and own.remote is not None:
+            adopted, behind = sh.reconcile_own(ov, own.remote)
+            if adopted is not None:                   # 云端有本地没有的更新（例如 device_id 被克隆）：并进本地
+                ov["entries"], ov["progress"], ov["_clock"] = adopted["entries"], adopted["progress"], adopted["_clock"]
+                ov["_rev"] = int(ov.get("_rev", 0)) + 1
+                self._overlay_dirty = True
+                self._overlay_timer.start()
+                self._invalidate_merged()
+                self._notice = "已把云端的更新并入本设备的书架状态（可能有另一台设备用了同一个设备 ID）"
+            if behind:
+                self._heal = True                     # 云端缺少 / 落后于本地：重推（服务器回滚、被覆盖的旧内容）
+            else:
+                self._heal = False
+                if own.stamp:
+                    self._state["remote_stamp"] = sh._clean_stamp(own.stamp)    # 已核对一致：下一轮戳没变就不必再 GET
+        elif own.missing:
+            self._heal = True                         # 自己的设备文件被删了而本地有内容：重推
 
     def _on_progress_pulled(self, res):
         self._progress_busy = False
         self._progress_error = ""
         if not self.cloud_enabled():
             return
+        old_entries = self.merged_view().get("entries")
         self._peers = res.peers.views
+        self._invalidate_merged()
         self._state["cursors"] = res.cursors
+        if res.peers.skew_ms is not None and not self._read_only:
+            self._note_skew(res.peers.skew_ms)
+        if res.peers.own is not None and not self._read_only:
+            self._check_own(res.peers.own)
         self._save_ui()
         changed = self._merge_progress(res.digest)
         changed = self._merge_progress(res.found) or changed
+        new_entries = self.merged_view().get("entries")
+        if new_entries != old_entries:                # 其它设备改了收藏 / 隐藏：就地更新、并让下一次重建带上新条目
+            self._decorate_books()
+            changed = True
         if changed:
             self._schedule_index_save()
             self.rescan(force=True, reuse=True)       # 只重建（不遍历磁盘）：本地书、云端书、local: 别名下的进度一并对上
-        self._update_continue()
-        self._update_status()
+        self.refresh()
         self.progressSynced.emit(len(res.digest) + len(res.found))
-        self.maybe_push()                             # 云端刚确认可达：把之前（离线 / 重启前）没推上去的摘要补推
+        self.maybe_push()                             # 云端刚确认可达：把之前（离线 / 重启前 / 自愈发现）没推上去的内容补推
 
     def _on_progress_failed(self, msg: str):
         self._progress_busy = False
@@ -1538,14 +1825,33 @@ class ShelfView(QWidget):
         self.rescan(force=True)
         return False
 
+    @staticmethod
+    def selected_books(view) -> List[sh.Book]:
+        """视图里选中的书（去重、按行序）。网格只有第 0 列被选，列表是整行，所以按行去重。"""
+        rows = {}
+        for ix in view.selectionModel().selectedIndexes():
+            b = ix.data(BookModel.BookRole)
+            if isinstance(b, sh.Book):
+                rows.setdefault(ix.row(), b)
+        return [rows[r] for r in sorted(rows)]
+
     def _show_menu(self, view, pos):
         idx = view.indexAt(pos)
         b = idx.data(BookModel.BookRole) if idx.isValid() else None
         if not isinstance(b, sh.Book):
             return
-        view.setCurrentIndex(idx)
+        if not view.selectionModel().isSelected(idx):
+            view.setCurrentIndex(idx)                 # 右键点在选区之外：只作用于被点的那一本
+        targets = self.selected_books(view) or [b]
         m = QMenu(self)
         m.addAction("打开", lambda: self.open_book(b))
+        if not self._read_only:                       # 收藏 / 隐藏：支持多选；只读实例（没拿到单实例锁）不提供
+            all_fav = all(x.fav for x in targets)
+            all_hid = all(x.hidden for x in targets)
+            m.addAction("取消收藏" if all_fav else "收藏", lambda: self.set_fav(targets, not all_fav))
+            m.addAction("取消隐藏" if all_hid else "从我的书架隐藏（只隐藏，不删文件）",
+                        lambda: self.set_hidden(targets, not all_hid))
+            m.addSeparator()
         if b.remote_rel and not b.local_paths and not b.removed and self.cloud_enabled():
             m.addAction("下载到本机", lambda: self.request_download(b, open_when_done=False))
         if b.where == "local" and b.local_paths and self.cloud_enabled():
@@ -1555,4 +1861,4 @@ class ShelfView(QWidget):
         if b.local_paths:
             m.addAction("在文件夹中显示", lambda: QDesktopServices.openUrl(
                 QUrl.fromLocalFile(os.path.dirname(b.local_paths[0]))))
-        m.exec(view.viewport().mapToGlobal(pos))
+        self.run_menu(m, view.viewport().mapToGlobal(pos))
