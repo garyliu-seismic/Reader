@@ -19,6 +19,8 @@ from .markdown import md_chapters, MD_HEAD_RE
 from .textio import MD_EXTS
 from .pager import LazyPager
 from .loader import BookLoader
+from . import sync as syncmod
+from .sync import SyncWorker
 from .view import PageView
 from .settings import SettingsDialog
 from .ai import (translate, lookup, AiWorker,
@@ -179,6 +181,20 @@ class MainWindow(QMainWindow):
         self._resize_timer.setSingleShot(True); self._resize_timer.setInterval(200)
         self._resize_timer.timeout.connect(self.reload_current)
 
+        # WebDAV 进度同步：所有网络都在后台线程，结果经 Signal 回主线程
+        self.sync = SyncWorker(self)
+        self.sync.pulled.connect(self._on_remote_progress)
+        self.sync.status.connect(lambda m: self.statusBar().showMessage(m, 5000))
+        self.sync.downloaded.connect(self.load_book)
+        self.sync.remoteList.connect(self._fill_remote_menu)
+        self._loaded_path = None       # 已完成加载的书（远端进度到达时用来判断能否立刻应用）
+        self._pending_remote = None    # 在书加载完成前到达的远端进度
+        self._last_saved_offset = None
+        self._progress_timer = QTimer(self)
+        self._progress_timer.setInterval(30000)
+        self._progress_timer.timeout.connect(lambda: self._save_progress(force=False))
+        self._progress_timer.start()
+
         self._build_toolbar(); self._build_menus()
         self._rebuild_recent_menu()
         self._update_bilingual_act()
@@ -263,6 +279,11 @@ class MainWindow(QMainWindow):
         self.library_menu.aboutToShow.connect(self._rebuild_library_menu)
         self.library_act = tb.addAction("📚 书库")
         self.library_act.setMenu(self.library_menu)
+        # 远程书库（WebDAV <base>/library）：展开时后台列目录
+        self.remote_menu = QMenu("远程书库", self)
+        self.remote_menu.aboutToShow.connect(self._rebuild_remote_menu)
+        self.remote_act = tb.addAction("☁️ 远程书库")
+        self.remote_act.setMenu(self.remote_menu)
         tb.addSeparator()
         # AI 辅助功能组
         ai_menu = QMenu("AI 功能", self)
@@ -343,6 +364,101 @@ class MainWindow(QMainWindow):
             for d in self.cfg["library_dirs"]:
                 rm.addAction(d, lambda d=d: self._remove_library_dir(d))
 
+    # ---- WebDAV：远程书库 / 进度同步 ----
+    def _sync_on(self):
+        return syncmod.client_from_cfg(self.cfg) is not None
+
+    def _rebuild_remote_menu(self):
+        m = self.remote_menu
+        m.clear()
+        if not self._sync_on():
+            m.addAction("（未启用 WebDAV：设置中填写地址并勾选启用）").setEnabled(False)
+            return
+        m.addAction("正在读取远程书库…").setEnabled(False)
+        self.sync.list_library(self.cfg, self.BOOK_EXTS)
+
+    def _fill_remote_menu(self, files):
+        m = self.remote_menu
+        m.clear()
+        for rel, size in files[:self.LIBRARY_MAX_FILES]:
+            m.addAction(rel, lambda rel=rel, size=size: self._open_remote_book(rel, size))
+        if not files:
+            m.addAction("（远程书库为空）").setEnabled(False)
+        m.addSeparator()
+        m.addAction("⬆️ 上传当前书到远程书库", self._upload_current_book)
+
+    def _open_remote_book(self, rel, size):
+        self.statusBar().showMessage(f"正在下载 {rel} …")
+        self.sync.download(self.cfg, rel, size)
+
+    def _upload_current_book(self):
+        if not self._sync_on():
+            self.statusBar().showMessage("未启用 WebDAV 同步")
+            return
+        if not self.book_path or not os.path.isfile(self.book_path):
+            self.statusBar().showMessage("请先打开一本书")
+            return
+        self.statusBar().showMessage("正在上传…")
+        self.sync.upload_book(self.cfg, self.book_path)
+
+    def _current_progress_record(self):
+        off = self.view.left_page_offset()
+        n = max(1, len(self.full_text))
+        ch = ""
+        try:
+            ch = self.pager.chapters[self.cur_chapter].title
+        except Exception:
+            pass
+        return off, syncmod.make_record(syncmod.book_id(self.book_path), off, off * 100.0 / n, ch,
+                                        self.cfg.get("device_name") or syncmod.default_device_name())
+
+    def _save_progress(self, force=True):
+        """保存本地进度（bookmarks.json）并（若启用）推送远端。
+        force=False 时仅在偏移变化后才保存（定时器用）。返回推送线程（便于 closeEvent 等待）。"""
+        if not (self.book_path and self.pager and self._loaded_path == self.book_path):
+            return None
+        off, rec = self._current_progress_record()
+        if not force and off == self._last_saved_offset:
+            return None
+        self._last_saved_offset = off
+        ent = self.bookmarks.setdefault(self.book_path, {})
+        ent["_progress_"] = off
+        ent["_progress_ts_"] = rec["updated"]
+        try:
+            save_json(BOOKMARKS_PATH, self.bookmarks)
+        except Exception:
+            pass
+        return self.sync.push(self.cfg, rec)
+
+    def _on_remote_progress(self, book_path, remote):
+        if remote is None or book_path != self.book_path:
+            return
+        if self._loaded_path != book_path or not self.pager:
+            self._pending_remote = (book_path, remote)   # 书还没加载完，加载后再应用
+            return
+        self._apply_remote_progress(remote)
+
+    def _apply_remote_progress(self, remote):
+        ent = self.bookmarks.get(self.book_path, {})
+        local = {"updated": ent.get("_progress_ts_", 0)}
+        if syncmod.merge_progress(local, remote) is not remote:
+            return
+        off = syncmod.resolve_offset(remote, len(self.full_text))
+        if off == self.view.left_page_offset():
+            return
+        self.goto_offset(off)
+        self._update_status()
+        self._last_saved_offset = off
+        ent = self.bookmarks.setdefault(self.book_path, {})
+        ent["_progress_"] = off
+        ent["_progress_ts_"] = float(remote.get("updated", 0))
+        try:
+            save_json(BOOKMARKS_PATH, self.bookmarks)
+        except Exception:
+            pass
+        self.statusBar().showMessage(
+            f"☁️ 已同步进度（来自 {remote.get('device', '?')}，{remote.get('percent', 0):.1f}%）", 6000)
+
     def _add_library_dir(self):
         d = QFileDialog.getExistingDirectory(self, "选择书库目录（如移动云盘同步文件夹）")
         if not d:
@@ -369,7 +485,11 @@ class MainWindow(QMainWindow):
 
     def load_book(self, path):
         self._tts_stop()
+        self._save_progress(force=True)      # 切书前先存当前书的进度
+        self._loaded_path = None
+        self._pending_remote = None
         self.book_path = path
+        self.sync.pull(self.cfg, path)       # 未启用时是 no-op
         self.load_bar.show()
         self.load_bar.setValue(0)
         self.statusBar().showMessage("正在读取文件…")
@@ -421,6 +541,12 @@ class MainWindow(QMainWindow):
         self.goto_offset(prog)
         self._update_status()
         self._add_recent(self.book_path)
+        self._loaded_path = self.book_path
+        self._last_saved_offset = self.view.left_page_offset()
+        if self._pending_remote and self._pending_remote[0] == self.book_path:
+            _, remote = self._pending_remote
+            self._pending_remote = None
+            self._apply_remote_progress(remote)
 
     # ---- 章节导航（惰性分页的入口） ----
     def load_chapter(self, ci, goto_end=False):
@@ -618,6 +744,12 @@ class MainWindow(QMainWindow):
                 "flip_effect": dlg.flip_effect.currentText(),
                 "bilingual": dlg.bilingual.isChecked(),
                 "bilingual_target": dlg.bilingual_target.currentText(),
+                "webdav_enabled": dlg.webdav_enabled.isChecked(),
+                "webdav_url": dlg.webdav_url.text().strip(),
+                "webdav_user": dlg.webdav_user.text().strip(),
+                "webdav_password": dlg.webdav_password.text(),
+                "sync_user_name": dlg.sync_user_name.text().strip() or "default",
+                "device_name": dlg.device_name.text().strip() or syncmod.default_device_name(),
             })
             save_json(CONFIG_PATH, self.cfg)
             set_net_proxy(self.cfg["proxy"])
@@ -1373,7 +1505,13 @@ class MainWindow(QMainWindow):
         self.tts_on = False
         if self.player:
             self.player.stop()
+        t = None
         if self.book_path and self.pager:
-            self.bookmarks.setdefault(self.book_path, {})["_progress_"] = self.view.left_page_offset()
-            save_json(BOOKMARKS_PATH, self.bookmarks)
+            if self._loaded_path == self.book_path:
+                t = self._save_progress(force=True)
+            else:   # 还在加载中：保持旧行为
+                self.bookmarks.setdefault(self.book_path, {})["_progress_"] = self.view.left_page_offset()
+                save_json(BOOKMARKS_PATH, self.bookmarks)
+        if t is not None:
+            t.join(3)   # 给远端推送一点时间（daemon 线程不会阻止退出）
         super().closeEvent(e)

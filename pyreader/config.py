@@ -197,6 +197,14 @@ def first_page_of_view(view_idx: int, ppv: int) -> int:
     return view_idx * ppv
 
 
+def _default_device_name():
+    try:
+        import socket
+        return socket.gethostname() or "device"
+    except Exception:
+        return "device"
+
+
 DEFAULT_CONFIG = {"font_family": "", "font_size": 15,
                   "line_spacing": 1.5, "margin_x": 28.0, "margin_y": 44.0,
                   "outer": 16.0, "gutter": 36.0, "para_spacing": 0.6,
@@ -211,7 +219,11 @@ DEFAULT_CONFIG = {"font_family": "", "font_size": 15,
                   "theme": DEFAULT_THEME, "recent": [], "library_dirs": [],
                   "bilingual": False, "bilingual_target": "中文",
                   "flip_effect": DEFAULT_FLIP_EFFECT,
-                  "single_page": False}
+                  "single_page": False,
+                  # WebDAV 进度同步（默认关闭；这些键只存本机 config.json，绝不上传）
+                  "webdav_enabled": False, "webdav_url": "",
+                  "webdav_user": "", "webdav_password": "",
+                  "sync_user_name": "default", "device_name": _default_device_name()}
 
 
 # ---- 从 .env 自动读取 AI 配置（DeepSeek 翻译 + Azure Speech 朗读）----
