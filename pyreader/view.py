@@ -6,7 +6,7 @@ from typing import List, Tuple, Optional
 from PySide6.QtCore import Qt, QRectF, QSizeF, QPointF, Signal, QObject, QTimer, QEvent, QVariantAnimation, QEasingCurve
 from PySide6.QtGui import QFont, QFontMetricsF, QPainter, QColor, QPen, QBrush, QLinearGradient, QPixmap, QTransform, QRadialGradient, QPainterPath, QPolygonF, QNativeGestureEvent, QImage
 from PySide6.QtWidgets import QWidget, QSwipeGesture, QPanGesture
-from .config import CLICK_ZONE, FLIP_MS, FLIP_PERSPECTIVE, FLIP_TILT, FLIP_STRIPS, FLIP_CURL, GUTTER, LINE_SPACING, MARGIN_X, MARGIN_Y, OUTER, PARA_SPACING, SWIPE_THRESHOLD, WHEEL_THRESHOLD
+from .config import pages_per_view, first_page_of_view, view_count, SINGLE_MAX_W, CLICK_ZONE, FLIP_MS, FLIP_PERSPECTIVE, FLIP_TILT, FLIP_STRIPS, FLIP_CURL, GUTTER, LINE_SPACING, MARGIN_X, MARGIN_Y, OUTER, PARA_SPACING, SWIPE_THRESHOLD, WHEEL_THRESHOLD
 from .model import Line, Page
 from .markdown import (_line_disp_to_src, _line_src_to_disp, _md_heading_font, _md_mono_font,
                        _md_style_font, MD_BAR_COLOR, MD_BAR_W, MD_CODE, MD_CODE_BG, MD_HR_COLOR,
@@ -32,7 +32,8 @@ class PageView(QWidget):
         self.outer = OUTER; self.gutter = GUTTER
         self.para_spacing = PARA_SPACING
         self.line_h = QFontMetricsF(self.font).height() * self.line_spacing
-        self.spread = 0
+        self.spread = 0                 # 当前屏序号（双页=跨页，单页=页下标）
+        self.single_page = False        # 单页显示模式，由 MainWindow 写入
         # 3D 翻页动画状态
         self._flip_anim = None          # QVariantAnimation（进行中）
         self._flip_dir = 0              # +1 向前 / -1 向后
@@ -62,6 +63,8 @@ class PageView(QWidget):
         self.book_title = ""
         self.chapter_title = ""
         self.chars_per_page = 400.0
+        self.page_info = None     # 可选 callable(chapter_idx, page_idx) -> (页码, 总页数)
+        self.chapter_index = 0
         self.setMouseTracking(True)
         self.setMinimumSize(600, 500)
         # 触摸板/触摸屏手势翻页
@@ -95,30 +98,55 @@ class PageView(QWidget):
 
     def pagination_params(self):
         """把当前布局转成 LazyPager 分页所需的参数（含由控件尺寸推算的页宽高）。"""
-        pw = (self.width() - self.gutter - 2 * self.outer) / 2
+        pw = self._page_width()
         ph = self.height() - 2 * self.outer
         return {"font": self.font, "page_size": QSizeF(pw, ph),
                 "line_spacing": self.line_spacing, "margin_x": self.margin_x,
                 "margin_y": self.margin_y, "para_spacing": self.para_spacing}
 
+    @property
+    def ppv(self) -> int:
+        """每屏页数（1=单页 / 2=双页跨页）。"""
+        return pages_per_view(self.single_page)
+
+    def _page_width(self):
+        if self.single_page:
+            return max(1.0, min(self.width() - 2 * self.outer, SINGLE_MAX_W))
+        return (self.width() - self.gutter - 2 * self.outer) / 2
+
     def page_rects(self):
+        """当前屏的页矩形：双页 [左, 右]，单页 [居中的一页]。"""
         w, h = self.width(), self.height()
-        pw = (w - self.gutter - 2 * self.outer) / 2
+        pw = self._page_width()
+        if self.single_page:
+            return [QRectF((w - pw) / 2, self.outer, pw, h - 2 * self.outer)]
         left = QRectF(self.outer, self.outer, pw, h - 2 * self.outer)
         right = QRectF(self.outer + pw + self.gutter, self.outer, pw, h - 2 * self.outer)
-        return left, right
+        return [left, right]
+
+    def visible_page_indices(self):
+        """当前屏各页矩形对应的页下标（与 page_rects 一一对应）。"""
+        base = first_page_of_view(self.spread, self.ppv)
+        return [base + i for i in range(self.ppv)]
 
     def left_page_offset(self) -> int:
-        if self.pages and self.spread * 2 < len(self.pages):
-            return self.pages[self.spread * 2].start
+        i = first_page_of_view(self.spread, self.ppv)
+        if self.pages and i < len(self.pages):
+            return self.pages[i].start
         return 0
+
+    def set_single_page(self, single: bool):
+        """切换单页/双页：先取消翻页动画；重排与位置恢复由 MainWindow.reload_current 完成。"""
+        self.cancel_flip()
+        self.single_page = bool(single)
+        self.update()
 
     def flip(self, delta: int):
         if not self.pages:
             return
         if self._flip_anim is not None:          # 动画进行中，忽略重复触发
             return
-        total = (len(self.pages) + 1) // 2
+        total = view_count(len(self.pages), self.ppv)
         ns = self.spread + delta
         if ns < 0:
             self.needChapter.emit(-1, True)
@@ -128,7 +156,7 @@ class PageView(QWidget):
             self.spread = ns
             self.pageChanged.emit(self.left_page_offset())
             self.update()
-        elif self._flip_effect == "平移滑动":
+        elif self._flip_effect == "平移滑动" or self.single_page:   # 单页无书脊，3D 翻书退化为平移
             self._start_slide(ns, delta)
         else:
             self._start_flip(ns, delta)
@@ -153,16 +181,7 @@ class PageView(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
         self._draw_background(painter)
-        left, right = self.page_rects()
-        self._draw_book_stack(painter, left, right)
-        self._draw_gutter_shadow(painter, left, right)
-        li, ri = self.spread * 2, self.spread * 2 + 1
-        if li < len(self.pages):
-            self._draw_page(painter, left, self.pages[li], self.book_title,
-                            spine_side=self._spine_side(li))
-        if ri < len(self.pages):
-            self._draw_page(painter, right, self.pages[ri], self.chapter_title,
-                            spine_side=self._spine_side(ri))
+        self._draw_spread(painter)
         painter.end()
         return pm
 
@@ -195,11 +214,15 @@ class PageView(QWidget):
         self.update()
 
     def _header_for(self, idx):
-        """按页在书中的位置（奇偶）返回页眉：左页=书名，右页=章节。"""
+        """按页在书中的位置（奇偶）返回页眉：左页=书名，右页=章节；单页固定章节名。"""
+        if self.single_page:
+            return self.chapter_title
         return self.book_title if idx % 2 == 0 else self.chapter_title
 
     def _spine_side(self, idx):
-        """按页在书中的位置返回装订侧：左页书脊在右，右页书脊在左。"""
+        """按页在书中的位置返回装订侧：左页书脊在右，右页书脊在左；单页固定在左。"""
+        if self.single_page:
+            return 'left'
         return 'right' if idx % 2 == 0 else 'left'
 
     def _flip_snapshot(self, rect, page, header, spine_side):
@@ -373,9 +396,9 @@ class PageView(QWidget):
         sa = int(105 * s)
         if sa > 0:
             p.save()
-            lr, rr = self.page_rects()
             clip = QPainterPath()
-            clip.addRect(lr); clip.addRect(rr)
+            for r_ in self.page_rects():
+                clip.addRect(r_)
             p.setClipPath(clip)
             x_far = fx + sgn * sw
             fxm = fx
@@ -453,7 +476,6 @@ class PageView(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
         self._draw_background(p)
-        left, right = self.page_rects()
         if self._flip_anim is not None and self._slide_snap_from is not None:
             # 平移滑动动画
             W = float(self.width())
@@ -463,16 +485,23 @@ class PageView(QWidget):
             p.drawPixmap(QPointF(W * self._flip_dir - offset * self._flip_dir, 0),
                          self._slide_snap_to)
         elif self._flip_anim is not None:
-            self._draw_flip(p, left, right)
+            self._draw_flip(p, *self.page_rects())
         else:
-            self._draw_book_stack(p, left, right)
-            self._draw_gutter_shadow(p, left, right)
-            li, ri = self.spread * 2, self.spread * 2 + 1
-            if li < len(self.pages):
-                self._draw_page(p, left, self.pages[li], self.book_title, spine_side=self._spine_side(li))
-            if ri < len(self.pages):
-                self._draw_page(p, right, self.pages[ri], self.chapter_title, spine_side=self._spine_side(ri))
+            self._draw_spread(p)
         p.end()
+
+    def _draw_spread(self, p):
+        """绘制当前屏（单页 / 双页跨页）；单页无书脊阴影与第二页。"""
+        rects = self.page_rects()
+        if self.single_page:
+            self._draw_book_stack(p, rects[0], None)
+        else:
+            self._draw_book_stack(p, rects[0], rects[1])
+            self._draw_gutter_shadow(p, rects[0], rects[1])
+        for rect, pi in zip(rects, self.visible_page_indices()):
+            if pi < len(self.pages):
+                self._draw_page(p, rect, self.pages[pi], self._header_for(pi),
+                                spine_side=self._spine_side(pi))
 
     def _draw_background(self, p):
         """桌面背景 + 中心向四周的柔光渐暗，增强立体景深。"""
@@ -488,6 +517,13 @@ class PageView(QWidget):
     def _draw_book_stack(self, p, left, right):
         """开卷书页下方的层叠纸边（纸厚 + 前切口），营造真实书的厚度。"""
         base = QColor(self.page_color)
+        if right is None:                # 单页：纸边向左右两侧、向下外扩
+            for k in range(6, 0, -1):
+                off = k * 1.4
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(base.darker(105 + k * 7))
+                p.drawRect(QRectF(left.left() - off, left.top(), left.width() + 2 * off, left.height() + off * 0.6))
+            return
         for k in range(6, 0, -1):        # 从外到内，最内层最后画（贴近书页）
             off = k * 1.4
             col = base.darker(105 + k * 7)     # 越靠外越暗
@@ -773,8 +809,11 @@ class PageView(QWidget):
                        header_text)
             p.setFont(self.font)
         # 页码（底部居中：当前 / 总页数）
-        pg = max(1, int(page.start / max(1.0, self.chars_per_page)) + 1)
-        total = max(1, int(len(self.full_text) / max(1.0, self.chars_per_page)))
+        if self.page_info is not None:
+            pg, total = self.page_info(self.chapter_index, page.index)
+        else:
+            pg = max(1, int(page.start / max(1.0, self.chars_per_page)) + 1)
+            total = max(1, int(len(self.full_text) / max(1.0, self.chars_per_page)))
         pf = QFont(self.font); pf.setPointSize(max(9, self.font.pointSize() - 4))
         p.setFont(pf); p.setPen(QColor(self.pageno_color))
         p.drawText(QRectF(rect.left(), rect.bottom() - self.margin_y + 10, rect.width(), self.margin_y - 18),
@@ -785,8 +824,7 @@ class PageView(QWidget):
         self._draw_cursors(p, rect, page)
 
     def _hit(self, pos):
-        left, right = self.page_rects()
-        for rect, pi in ((left, self.spread * 2), (right, self.spread * 2 + 1)):
+        for rect, pi in zip(self.page_rects(), self.visible_page_indices()):
             if pi < len(self.pages) and rect.contains(pos):
                 page = self.pages[pi]
                 y = rect.top() + self.margin_y
@@ -880,9 +918,8 @@ class PageView(QWidget):
             if x < w * CLICK_ZONE or x > w * (1 - CLICK_ZONE):
                 self.setCursor(Qt.CursorShape.PointingHandCursor)
             else:
-                l, r = self.page_rects()
                 self.setCursor(Qt.CursorShape.IBeamCursor
-                               if (l.contains(pos) or r.contains(pos))
+                               if any(r.contains(pos) for r in self.page_rects())
                                else Qt.CursorShape.ArrowCursor)
 
     def mouseReleaseEvent(self, e):

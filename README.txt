@@ -78,6 +78,8 @@ PyReader —— 基于 Python 的文本小说阅读器
   pip install sherpa-onnx     # 语音朗读（Melo 离线中英混读，可选）
   pip install mobi            # Kindle 格式支持（mobi/azw/azw3/prc，可选）
   pip install pymupdf         # PDF 电子书（可选，仅限有文字层的 PDF）
+  pip install python-docx     # Word 文档 docx（可选）
+  pip install python-pptx     # PowerPoint pptx（可选，演讲者备注不朗读）
   pip install piper-tts       # 离线语音朗读（可选，无需联网，首次自动下载模型）
 
 【编码说明】
@@ -172,6 +174,8 @@ PyReader —— 基于 Python 的文本小说阅读器
   pip install sherpa-onnx     # 语音朗读（Melo 离线中英混读，可选）
   pip install mobi            # Kindle 格式支持（mobi/azw/azw3/prc，可选）
   pip install pymupdf         # PDF 电子书（可选，仅限有文字层的 PDF）
+  pip install python-docx     # Word 文档 docx（可选）
+  pip install python-pptx     # PowerPoint pptx（可选，演讲者备注不朗读）
   pip install piper-tts       # 离线语音朗读（可选，无需联网，首次自动下载模型）
 
 【编码说明】

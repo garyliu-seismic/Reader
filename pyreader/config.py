@@ -173,6 +173,30 @@ DEFAULT_THEME = "夜间（默认）"
 FLIP_EFFECTS = ["3D 翻书", "平移滑动", "直接切换"]
 DEFAULT_FLIP_EFFECT = "3D 翻书"
 
+# 单页模式：单页最大宽度（窗口再宽也居中显示，避免行过长）
+SINGLE_MAX_W = 760.0
+
+
+def pages_per_view(single: bool) -> int:
+    """每屏页数：单页模式 1，默认双页跨页 2。"""
+    return 1 if single else 2
+
+
+def view_count(npages: int, ppv: int) -> int:
+    """章内共有多少屏（跨页）。"""
+    return (npages + ppv - 1) // ppv
+
+
+def view_of_page(page_idx: int, ppv: int) -> int:
+    """页下标 → 所在屏序号。"""
+    return page_idx // ppv
+
+
+def first_page_of_view(view_idx: int, ppv: int) -> int:
+    """屏序号 → 该屏第一页的页下标。"""
+    return view_idx * ppv
+
+
 DEFAULT_CONFIG = {"font_family": "", "font_size": 15,
                   "line_spacing": 1.5, "margin_x": 28.0, "margin_y": 44.0,
                   "outer": 16.0, "gutter": 36.0, "para_spacing": 0.6,
@@ -186,7 +210,8 @@ DEFAULT_CONFIG = {"font_family": "", "font_size": 15,
                   "azure_tts_key2": "", "azure_tts_region2": "",
                   "theme": DEFAULT_THEME, "recent": [],
                   "bilingual": False, "bilingual_target": "中文",
-                  "flip_effect": DEFAULT_FLIP_EFFECT}
+                  "flip_effect": DEFAULT_FLIP_EFFECT,
+                  "single_page": False}
 
 
 # ---- 从 .env 自动读取 AI 配置（DeepSeek 翻译 + Azure Speech 朗读）----

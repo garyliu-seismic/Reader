@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QListWidget, QListWidgetIte
                                QFileDialog, QMessageBox, QProgressBar, QSlider, QDockWidget,
                                QLineEdit, QToolButton, QWidgetAction, QHBoxLayout, QFrame,
                                QTabWidget, QPushButton, QSizePolicy, QSplitter)
-from .config import (CONFIG_PATH, BOOKMARKS_PATH, OUTER, MARGIN_X, MARGIN_Y, GUTTER,
+from .config import (view_count, view_of_page, CONFIG_PATH, BOOKMARKS_PATH, OUTER, MARGIN_X, MARGIN_Y, GUTTER,
                      load_env_defaults,
                      LINE_SPACING, PARA_SPACING, _HAS_MULTIMEDIA,
                      load_json, save_json, default_cjk_font, THEMES, DEFAULT_THEME, DEFAULT_CONFIG,
@@ -184,6 +184,8 @@ class MainWindow(QMainWindow):
         self._update_bilingual_act()
         # 翻页方式写入 view
         self.view._flip_effect = self.cfg.get("flip_effect", DEFAULT_FLIP_EFFECT)
+        self.view.single_page = bool(self.cfg.get("single_page", False))
+        self.single_act.setChecked(self.view.single_page)
         if self.bilingual_on:
             self.bilingual_dock.show()
 
@@ -228,6 +230,9 @@ class MainWindow(QMainWindow):
         tb.addAction("◀ 上一页", lambda: self.view.flip(-1))
         tb.addAction("下一页 ▶", lambda: self.view.flip(1))
         tb.addAction("添加书签", self.add_bookmark)
+        self.single_act = tb.addAction("📄 单页", lambda: self.set_single_page(self.single_act.isChecked()))
+        self.single_act.setCheckable(True)
+        self.single_act.setToolTip("单页 / 双页跨页 切换")
         tb.addSeparator()
         self.tts_act = tb.addAction("🔊 朗读", self.toggle_reading)
         self.stop_act = tb.addAction("⏹ 停止", self.stop_reading)
@@ -300,7 +305,7 @@ class MainWindow(QMainWindow):
     def open_book(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "打开小说", "",
-            "电子书 (*.txt *.md *.markdown *.epub *.html *.htm *.mobi *.azw *.azw3 *.prc *.pdf *.docx);;文本 (*.txt *.md *.markdown);;EPUB (*.epub);;Kindle (*.mobi *.azw *.azw3 *.prc);;网页 (*.html *.htm);;PDF (*.pdf);;Word (*.docx)")
+            "电子书 (*.txt *.md *.markdown *.epub *.html *.htm *.mobi *.azw *.azw3 *.prc *.pdf *.docx *.pptx);;文本 (*.txt *.md *.markdown);;EPUB (*.epub);;Kindle (*.mobi *.azw *.azw3 *.prc);;网页 (*.html *.htm);;PDF (*.pdf);;Word (*.docx);;PowerPoint (*.pptx)")
         if path:
             self.load_book(path)
 
@@ -347,6 +352,8 @@ class MainWindow(QMainWindow):
             self.view._img_cache.clear()
             self.pager = LazyPager(text, chapters, md=is_md, pdf_blocks=pdf_blocks)
         self.pager.set_params(self.view.pagination_params())
+        # 版式块文档（PDF/DOCX/PPTX）用真实页数计页码；纯文本/EPUB 仍按字数估算
+        self.view.page_info = self.pager.page_info if (not self.view.scan_mode and extra.get("blocks") is not None and not is_md) else None
         self.view.full_text = text
         self.view.book_title = title or os.path.splitext(os.path.basename(self.book_path))[0]
         self._build_toc()
@@ -363,13 +370,14 @@ class MainWindow(QMainWindow):
             return
         ci = max(0, min(len(self.pager.chapters) - 1, ci))
         self.cur_chapter = ci
+        self.view.chapter_index = ci
         self.view.cancel_flip()
         self.view.pages = self.pager.pages_of(ci)      # 只分这一章，毫秒级
         self.view.chapter_title = self.pager.chapters[ci].title
         pages = self.pager.pages_of(ci)
         ch = self.pager.chapters[ci]
         self.view.chars_per_page = max(1, (ch.end - ch.start) / max(1, len(pages))) if pages else 400.0
-        self.view.spread = ((len(self.view.pages) - 1) // 2) if goto_end else 0
+        self.view.spread = (view_count(len(self.view.pages), self.view.ppv) - 1) if goto_end else 0
         self.view.update()
 
     def goto_offset(self, offset):
@@ -379,7 +387,7 @@ class MainWindow(QMainWindow):
         self.load_chapter(ci)
         for p in self.pager.pages_of(ci):
             if p.start <= offset < p.end:
-                self.view.spread = p.index // 2
+                self.view.spread = view_of_page(p.index, self.view.ppv)
                 break
         self.view.update()
 
@@ -396,10 +404,23 @@ class MainWindow(QMainWindow):
             save_json(CONFIG_PATH, self.cfg)
             self.reload_current()
 
-    def reload_current(self):
+    def set_single_page(self, single):
+        """切换单页/双页：取消翻页动画，按字符偏移重排并恢复阅读位置。"""
+        single = bool(single)
+        self.single_act.setChecked(single)
+        if single == self.view.single_page:
+            return
+        off = self.view.left_page_offset()     # 必须在切换前取（spread 含义随每屏页数变化）
+        self.view.set_single_page(single)
+        self.cfg["single_page"] = single
+        save_json(CONFIG_PATH, self.cfg)
+        self.reload_current(off)
+
+    def reload_current(self, off=None):
         if not self.pager:
             return
-        off = self.view.left_page_offset()
+        if off is None:
+            off = self.view.left_page_offset()
         self.view.set_layout(self._make_layout())
         self.pager.set_params(self.view.pagination_params())
         self.load_chapter(self.cur_chapter)
@@ -519,6 +540,7 @@ class MainWindow(QMainWindow):
     def open_settings(self):
         dlg = SettingsDialog(self.cfg, self)
         if dlg.exec():
+            self.set_single_page(dlg.single_page.isChecked())
             self.cfg.update({
                 "api_key": dlg.key.text().strip(), "api_base": dlg.base.text().strip(),
                 "model": dlg.model.text().strip(), "api_version": dlg.api_version.text().strip(),
@@ -1078,7 +1100,7 @@ class MainWindow(QMainWindow):
         if not self.pager:
             return
         pages = self.view.pages
-        vis = pages[self.view.spread * 2:self.view.spread * 2 + 2]
+        vis = [pages[i] for i in self.view.visible_page_indices() if i < len(pages)]
         if vis and vis[0].start <= off < vis[-1].end:
             self.view.update()
             return
@@ -1109,7 +1131,7 @@ class MainWindow(QMainWindow):
             if mode == 1:
                 # 本章页码
                 cur_pg  = self.view.spread + 1
-                tot_pg  = max(1, (len(pages) + 1) // 2)
+                tot_pg  = max(1, view_count(len(pages), self.view.ppv))
                 label   = f"{cur_pg}/{tot_pg}页"
                 tip     = "本章页码（点击切换）"
             elif mode == 2:

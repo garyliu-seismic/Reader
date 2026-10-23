@@ -3,6 +3,7 @@ from PySide6.QtCore import QObject, Signal
 from .textio import load_epub, load_html_file, load_markdown, decode_text, scan_chapters
 from .pdf import load_pdf, load_kindle
 from .docx import load_docx
+from .pptx import load_pptx
 from .cache import load_cache, save_cache
 
 # ============ 后台加载（不阻塞 UI） ============
@@ -12,7 +13,7 @@ class BookLoader(QObject):
     progress = Signal(int, str)       # (百分比, 说明)
 
     # 这些格式缓存章节后，重新打开仍需完整解析（因为有图片/渲染块 extra）
-    _FULL_PARSE_EXTS = {".pdf", ".docx"}
+    _FULL_PARSE_EXTS = {".pdf", ".docx", ".pptx"}
 
     def __init__(self, path):
         super().__init__()
@@ -52,6 +53,10 @@ class BookLoader(QObject):
             elif ext == ".docx":
                 self.progress.emit(10, "解析 DOCX…")
                 text, chapters, title, extra = load_docx(
+                    self.path, progress=lambda p, m: self.progress.emit(p, m))
+            elif ext == ".pptx":
+                self.progress.emit(10, "解析 PPTX…")
+                text, chapters, title, extra = load_pptx(
                     self.path, progress=lambda p, m: self.progress.emit(p, m))
             elif ext in (".md", ".markdown"):
                 self.progress.emit(10, "解析 Markdown…")

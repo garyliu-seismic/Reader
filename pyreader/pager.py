@@ -36,14 +36,31 @@ class LazyPager:
                     self.chapters.append(_Chapter(len(self.chapters), f"{title} ({k})", p, e))
                     p, k = e, k + 1
         self._cache = {}
+        self._npages = {}            # 章节索引 -> 已排版页数（不随缓存淘汰，供页码估算）
 
     def set_params(self, params):
         self._params = params
         self._cache.clear()          # 布局变了，缓存全部失效
+        self._npages.clear()
 
     def chapter_index_at(self, offset: int) -> int:
         starts = [c.start for c in self.chapters]
         return max(0, bisect.bisect_right(starts, offset) - 1)
+
+    def page_info(self, ci: int, pi: int):
+        """(当前页码, 总页数)：已排版章节用真实页数，未排版章节按已知章节的字数/页估算（至少 1 页）。
+        用于「每页字数很少」的版式文档（如 PPTX 整页图片幻灯片），避免全文字数/章均字数虚高。"""
+        known = self._npages
+        chars = sum(self.chapters[i].end - self.chapters[i].start for i in known)
+        pgs = sum(known.values())
+        cpp = max(200.0, chars / pgs) if pgs else 400.0   # 下限：每页实际容量不会低于 ~200 字，避免被图片页拉低
+        total = before = 0
+        for i, c in enumerate(self.chapters):
+            n = known.get(i) or max(1, round((c.end - c.start) / cpp))
+            if i < ci:
+                before += n
+            total += n
+        return before + pi + 1, max(total, before + pi + 1)
 
     def pages_of(self, ci: int) -> List[Page]:
         pages = self._cache.get(ci)
@@ -88,6 +105,7 @@ class LazyPager:
                                  margin_x=p["margin_x"], margin_y=p["margin_y"],
                                  para_spacing=p.get("para_spacing", PARA_SPACING))
             self._cache[ci] = pages
+            self._npages[ci] = len(pages)
             # 淘汰最远的章节，保留当前章节及其邻居（跨章翻页无感）
             if len(self._cache) > MAX_CACHE:
                 far = sorted((abs(k - ci), k) for k in self._cache if k != ci)

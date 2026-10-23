@@ -8,11 +8,13 @@ import os
 
 datas = []
 binaries = []
-hiddenimports = ['pymupdf', 'sherpa_onnx', 'mobi', 'piper', 'loguru', 'edge_tts',
+hiddenimports = ['pymupdf', 'sherpa_onnx', 'mobi', 'piper', 'loguru', 'edge_tts', 'docx', 'pptx', 'lxml', 'lxml.etree', 'lxml._elementpath',
                  'PySide6.QtMultimedia', 'PySide6.QtNetwork']
 tmp_ret = collect_all('pymupdf')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('onnxruntime')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('pptx')     # python-pptx 模板/XML 资源
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('PIL')      # 3D 翻页透视扭曲
 binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
