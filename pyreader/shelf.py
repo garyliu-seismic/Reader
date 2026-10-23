@@ -1,0 +1,1045 @@
+"""书架（Shelf）纯逻辑模型：无 Qt、无网络。设计见 c:\\tmp\\pyreader-bookshelf-design.md。
+
+内容：
+  - fp / fp_weak：内容指纹提示（NFC 规范化文件名；不是身份）
+  - scan_local / build_books：本地与云端书目归并成 Book（归并只看来源，不单靠 fp）
+  - derive_status / filter_books / sort_books：派生状态、智能书架、搜索、排序
+  - 覆盖层（overlay）：validate_overlay → merge → set_field（混合逻辑时钟）→ to_wire（上传白名单）
+  - load_state / save_state / load_overlay / save_overlay：~/.pyreader/shelf/ 下的原子读写
+
+覆盖层的内存形式（「视图」，由 validate_overlay / merge 产生）：
+    {"version": 1, "_view": True, "device_id": <写者，仅本设备覆盖层有>, "_clock": [时钟异常设备],
+     "entries":  {book_id: {"fav": [bool, ts_ms, dev], "hidden": [...], "meta": [{"fp","title"}, ts_ms, dev],
+                            "rekeyed_from": [book_id...], <未知字段原样保留>}},
+     "progress": {book_id: {"percent": float, "updated": 秒, "device": dev}}}
+每个寄存器带写者 dev，是为了让「ts 相同取 device_id 大者」在多次合并后仍满足交换律 / 结合律 / 幂等。
+线上格式（to_wire）里寄存器只有 [值, ts] 两项：写者就是文件名里的 device_id。
+远端内容一律先 validate_overlay(raw, device_id=<取自通过校验的文件名>)，再 merge。
+"""
+import hashlib
+import json
+import math
+import os
+import re
+import secrets
+import socket
+import time
+import unicodedata
+from dataclasses import dataclass, field
+from typing import Dict, Iterable, List, Optional
+
+from .store import is_hidden_name, load_json, normalize_rel, safe_component, save_json
+
+WIRE_VERSION = 1
+STATE_VERSION = 1
+
+BOOK_EXTS = (".txt", ".md", ".markdown", ".epub", ".html", ".htm", ".mobi",
+             ".azw", ".azw3", ".prc", ".pdf", ".docx", ".pptx")
+
+FUTURE_LIMIT_MS = 24 * 3600 * 1000       # 超过「现在 + 24 小时」的时间戳属于时钟异常
+CLAMPED_TS = 1                           # 时钟异常的 ts 截断成最旧的 1ms（见 _parse_ts 的说明）
+MAX_ENTRIES = 20000                      # 覆盖层条目数 / 进度条目数上限
+MAX_STR = 256                            # 字符串长度上限
+MAX_REKEYED = 100
+MAX_EXTRA_BYTES = 1024                   # 未知字段值序列化后的上限
+SCAN_LIMIT = 5000                        # 本地扫描总量上限（Library 菜单的 300 上限不沿用）
+DONE_PERCENT = 97.0                      # >= 97 视为读完
+
+CLOUD = "cloud:"
+LOCAL = "local:"
+
+REG_FIELDS = ("fav", "hidden")           # 布尔 LWW 寄存器
+KNOWN_ENTRY_KEYS = frozenset(("fav", "hidden", "meta", "rekeyed_from"))
+
+_HEX40 = re.compile(r"[0-9a-f]{40}", re.ASCII)
+_BIDI = set("؜‎‏‪‫‬‭‮⁦⁧⁨⁩")
+
+
+def _canon(v) -> str:
+    return json.dumps(v, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+def _nfc(s: str) -> str:
+    return unicodedata.normalize("NFC", s)
+
+
+def _clean_str(s, limit=MAX_STR) -> Optional[str]:
+    """去掉控制字符与 bidi 控制字符、截断到 limit。非字符串返回 None。"""
+    if not isinstance(s, str):
+        return None
+    s = "".join(c for c in s if unicodedata.category(c) != "Cc" and c not in _BIDI)
+    return s[:limit]
+
+
+def _default_root() -> str:
+    """数据根（等价于 config.APP_DIR）。延迟求值：尊重 PYREADER_HOME，且 import 本模块不触碰磁盘。"""
+    from .config import resolve_app_dir
+    return resolve_app_dir()
+
+
+def _sync():
+    """延迟导入 sync：book_id 直接复用 sync.book_id（design：不另造 id 体系），
+    同时让 shelf 模块本身在 import 时不依赖 Qt。"""
+    from . import sync
+    return sync
+
+
+def _hostname() -> str:
+    try:
+        h = socket.gethostname() or ""
+    except Exception:
+        h = ""
+    h = re.sub(r"[^a-z0-9-]", "", h.lower()).strip("-")[:40]
+    return h or "device"
+
+
+# ================================================================== 指纹
+def fp_weak(name: str, size: int) -> str:
+    """弱指纹：sha1(NFC(文件名) + 大小)。云端书下载前只能算这个；本地书也用它做跨来源提示比较。"""
+    base = _nfc(os.path.basename(str(name).replace("\\", "/")))
+    return hashlib.sha1(f"{base}|{int(size)}".encode("utf-8")).hexdigest()[:20]
+
+
+def fp(path: str) -> Optional[str]:
+    """强指纹：sha1(NFC(文件名) + 大小 + 首尾各 64KB 的 sha1)，取前 20 位十六进制。读不了返回 None。
+    只是提示，不是身份：不能单独用作自动合并依据。"""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            head = f.read(65536)
+            f.seek(max(0, size - 65536))
+            tail = f.read(65536)
+    except OSError:
+        return None
+    h = hashlib.sha1()
+    h.update(f"{_nfc(os.path.basename(path))}|{size}|".encode("utf-8"))
+    h.update(hashlib.sha1(head).digest())
+    h.update(hashlib.sha1(tail).digest())
+    return h.hexdigest()[:20]
+
+
+def local_id_for(name: str, size: int) -> str:
+    """与 sync.book_id 对非 remote_books 文件的算法一致：local:sha1(basename+size)。
+    用来给「云端书的本地缓存副本」查它原来的 local: 进度别名（design §4.9 进度读取回退）。"""
+    return LOCAL + hashlib.sha1(f"{os.path.basename(name)}{int(size)}".encode("utf-8")).hexdigest()
+
+
+def valid_book_id(bid) -> bool:
+    """book_id 只能是 remote:<合法 rel> 或 local:<40 位小写十六进制>。"""
+    if not isinstance(bid, str) or len(bid) > 1100:
+        return False
+    if bid.startswith("remote:"):
+        rel = bid[7:]
+        return normalize_rel(rel) is not None and not any(is_hidden_name(s) for s in rel.split("/"))
+    if bid.startswith(LOCAL):
+        return _HEX40.fullmatch(bid[6:]) is not None
+    return False
+
+
+def valid_remote_rel(rel) -> bool:
+    """云端 library/ 下可显示的书：rel 合法、没有点 / ~$ 开头的段、扩展名在 BOOK_EXTS 内。"""
+    if normalize_rel(rel) is None:
+        return False
+    segs = rel.split("/")
+    if any(is_hidden_name(s) for s in segs):
+        return False
+    return segs[-1].lower().endswith(BOOK_EXTS)
+
+
+# ================================================================== 状态派生
+def derive_status(percent: Optional[float], has_progress: bool = False) -> str:
+    """percent == 0 未读；0 < percent < 97 在读；>= 97 读完。
+    percent 未知（None）时：已知有本地进度偏移（has_progress）则按「在读」，否则「未读」。"""
+    if percent is None:
+        return "reading" if has_progress else "unread"
+    try:
+        p = float(percent)
+    except (TypeError, ValueError):
+        return "unread"
+    if not math.isfinite(p) or p <= 0:
+        return "unread"
+    return "done" if p >= DONE_PERCENT else "reading"
+
+
+# ================================================================== 书签键归一
+def norm_path(p: str) -> str:
+    """书签键归一：打开对话框返回正斜杠、扫描得到反斜杠、Windows 盘符大小写不一 → 统一后再比。"""
+    return os.path.normcase(os.path.normpath(p))
+
+
+def norm_bookmarks(bookmarks) -> Dict[str, dict]:
+    """{归一后的路径: 条目}。只读，不改写 bookmarks。多个键归一后相同则 _progress_ts_ 较新者优先。"""
+    out: Dict[str, dict] = {}
+    if not isinstance(bookmarks, dict):
+        return out
+    for k, v in bookmarks.items():
+        if not isinstance(k, str) or not isinstance(v, dict) or not k:
+            continue
+        nk = norm_path(k)
+        old = out.get(nk)
+        if old is None or _num(v.get("_progress_ts_"), 0.0) > _num(old.get("_progress_ts_"), 0.0):
+            out[nk] = v
+    return out
+
+
+def bookmark_for(bookmarks, path: str) -> Optional[dict]:
+    """按归一后的路径查书签条目（_progress_ / _progress_ts_ 都在条目里）。"""
+    return norm_bookmarks(bookmarks).get(norm_path(path))
+
+
+def _num(x, default=None):
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
+        return default
+    return float(x) if math.isfinite(x) else default
+
+
+# ================================================================== 本地扫描
+@dataclass
+class LocalFile:
+    path: str
+    root: str            # 书库根（library_dirs 中的一项），正斜杠
+    sub: str             # 根下的相对文件夹（/ 分隔，根目录为 ""）
+    name: str
+    size: int
+    mtime: float
+
+
+class ScanList(list):
+    truncated = False    # 达到 limit 被截断
+
+
+def scan_local(roots: Iterable[str], limit: int = SCAN_LIMIT, exts=BOOK_EXTS, should_stop=None) -> ScanList:
+    """遍历书库目录，返回 LocalFile 列表。忽略点 / ~$ 开头的文件与文件夹、非电子书扩展名、符号链接目录。
+    顺序确定（目录与文件名排序）。应在后台线程调用；should_stop() 为真时尽快返回。"""
+    out = ScanList()
+    for root in roots:
+        if not isinstance(root, str) or not os.path.isdir(root):
+            continue
+        rroot = root.replace("\\", "/").rstrip("/") or root
+        for dp, dns, fns in os.walk(root, followlinks=False):
+            if should_stop is not None and should_stop():
+                return out
+            dns[:] = sorted(d for d in dns if not is_hidden_name(d))
+            rel = os.path.relpath(dp, root)
+            sub = "" if rel == "." else rel.replace(os.sep, "/")
+            for fn in sorted(fns):
+                if is_hidden_name(fn) or not fn.lower().endswith(exts):
+                    continue
+                p = os.path.join(dp, fn)
+                try:
+                    st = os.stat(p)
+                except OSError:
+                    continue
+                if len(out) >= limit:
+                    out.truncated = True
+                    return out
+                out.append(LocalFile(p, rroot, sub, fn, int(st.st_size), float(st.st_mtime)))
+    return out
+
+
+# ================================================================== Book / build_books
+@dataclass
+class RemoteFile:
+    rel: str
+    size: int = 0
+    mtime: float = 0.0
+
+
+@dataclass
+class Book:
+    id: str
+    title: str
+    fmt: str = ""
+    size: int = 0
+    shelf: str = ""                  # cloud:<文件夹>（根目录为 "cloud:"）或 local:<根>/<子文件夹>
+    fp: str = ""                     # 弱指纹（提示用）
+    where: str = "local"             # cloud 仅云端 | synced 已同步 | local 仅本地 | removed 云端已移除 | missing 占位
+    remote_rel: str = ""
+    mtime: float = 0.0               # 文件修改时间（云端取远端 mtime），用于「最近添加」
+    local_paths: List[str] = field(default_factory=list)
+    author: str = ""
+    fav: bool = False
+    hidden: bool = False
+    percent: Optional[float] = None
+    has_progress: bool = False       # 本机书签里有 _progress_ 偏移（percent 未知时用来判「在读」）
+    progress_updated: float = 0.0
+    progress_device: str = ""
+    last_opened: float = 0.0
+    last_read: float = 0.0           # max(last_opened, 进度更新时间, 书签时间)
+    same_as: List[str] = field(default_factory=list)   # 来源不同但文件名+大小相同的书（「可能是同一本书」）
+
+    @property
+    def status(self) -> str:
+        return derive_status(self.percent, self.has_progress)
+
+    @property
+    def filename(self) -> str:
+        if self.remote_rel:
+            return self.remote_rel.rsplit("/", 1)[-1]
+        return os.path.basename(self.local_paths[0]) if self.local_paths else self.title
+
+    @property
+    def removed(self) -> bool:
+        return self.where == "removed"
+
+    @property
+    def placeholder(self) -> bool:
+        return self.where == "missing"
+
+    @property
+    def auto_hidden(self) -> bool:
+        """默认不显示：其它设备的占位；云端已移除且本机无副本、也不在读（design §4.8 / §4.9）。"""
+        if self.where == "missing":
+            return True
+        return self.where == "removed" and not self.local_paths and self.status != "reading"
+
+
+def shelf_of_remote(rel: str) -> str:
+    folder = rel.rsplit("/", 1)[0] if "/" in rel else ""
+    return CLOUD + folder
+
+
+def shelf_of_local(f: LocalFile) -> str:
+    return LOCAL + (f.root + "/" + f.sub if f.sub else f.root)
+
+
+def _stem(name: str) -> str:
+    return os.path.splitext(name)[0] or name
+
+
+def field_value(view: dict, bid: str, name: str, default=None):
+    """从覆盖层视图取某条目的寄存器值。"""
+    reg = ((view or {}).get("entries", {}).get(bid) or {}).get(name)
+    if isinstance(reg, (list, tuple)) and len(reg) >= 2:
+        return reg[0]
+    return default
+
+
+def _coerce_remote(x) -> Optional[RemoteFile]:
+    if isinstance(x, RemoteFile):
+        r = x
+    elif isinstance(x, dict):
+        r = RemoteFile(x.get("rel"), x.get("size", 0), x.get("mtime", 0.0))
+    elif isinstance(x, (tuple, list)) and x:
+        r = RemoteFile(*x[:3])
+    else:
+        return None
+    if not valid_remote_rel(r.rel):
+        return None
+    try:
+        return RemoteFile(r.rel, int(r.size or 0), float(r.mtime or 0.0))
+    except (TypeError, ValueError):
+        return None
+
+
+def build_books(local_files: Iterable[LocalFile] = (), remote_files=None, overlay: Optional[dict] = None, *,
+                bookmarks=None, recent: Iterable[str] = (), opened: Optional[dict] = None,
+                removed: Iterable[str] = ()) -> Dict[str, Book]:
+    """把本地扫描、云端列表、覆盖层视图与进度归并成 {book_id: Book}。纯函数，不做网络。
+
+    - remote_files：None 表示云端列表未知（离线 / 列表不完整）；此时不会据列表推断任何「消失」。
+    - 归并只靠来源：本地文件恰好位于 remote_books/<rel> 才是该云端书的缓存副本（sync.book_id 给出 remote:<rel>）。
+      其它本地文件即使文件名+大小相同也是独立卡片，仅在 same_as 里互相提示。
+    - 同一 book_id 的多个本地路径（同名同大小的拷贝）合成一张卡片（book_id 的既有语义）。
+    - removed：调用方按「连续两轮完整列表都缺失」判定出的 id 集合；本函数不做二轮判断。
+    - overlay：validate_overlay / merge 产生的视图（None = 无覆盖层）。
+    """
+    sync = _sync()
+    overlay = overlay or {}
+    entries = overlay.get("entries", {}) if isinstance(overlay, dict) else {}
+    digest = overlay.get("progress", {}) if isinstance(overlay, dict) else {}
+    removed = set(removed or ())
+    opened = opened or {}
+    nbm = norm_bookmarks(bookmarks)
+    books: Dict[str, Book] = {}
+
+    # 1) 云端列表
+    remote_ids = set()
+    for x in (remote_files or ()):
+        r = _coerce_remote(x)
+        if r is None:
+            continue
+        bid = "remote:" + r.rel
+        remote_ids.add(bid)
+        name = r.rel.rsplit("/", 1)[-1]
+        b = Book(bid, _stem(name), os.path.splitext(name)[1].lstrip(".").lower(), r.size,
+                 shelf_of_remote(r.rel), fp_weak(name, r.size), "cloud", r.rel, r.mtime)
+        cp = os.path.join(sync.REMOTE_BOOKS_DIR, *r.rel.split("/"))
+        if os.path.isfile(cp):
+            b.local_paths.append(cp)
+            b.where = "synced"
+        books[bid] = b
+
+    # 2) 本地文件
+    for f in local_files:
+        bid = sync.book_id(f.path)
+        b = books.get(bid)
+        if b is None:
+            if bid.startswith("remote:"):
+                rel = bid[7:]
+                b = Book(bid, _stem(f.name), os.path.splitext(f.name)[1].lstrip(".").lower(), f.size,
+                         shelf_of_remote(rel), fp_weak(f.name, f.size),
+                         "removed" if (remote_files is not None and bid in removed) else "synced", rel, f.mtime)
+            else:
+                b = Book(bid, _stem(f.name), os.path.splitext(f.name)[1].lstrip(".").lower(), f.size,
+                         shelf_of_local(f), fp_weak(f.name, f.size), "local", "", f.mtime)
+            books[bid] = b
+        if norm_path(f.path) not in {norm_path(x) for x in b.local_paths}:
+            b.local_paths.append(f.path)
+        if b.where == "cloud":
+            b.where = "synced"
+
+    # 3) 覆盖层里有、本机什么都没找到的条目 → 占位
+    for bid in sorted(entries):
+        if bid in books or not valid_book_id(bid):
+            continue
+        meta = field_value(overlay, bid, "meta") or {}
+        title = meta.get("title") or (bid[7:].rsplit("/", 1)[-1] if bid.startswith("remote:") else bid[6:14])
+        rel = bid[7:] if bid.startswith("remote:") else ""
+        b = Book(bid, title, "", 0, shelf_of_remote(rel) if rel else "", meta.get("fp", ""), "missing", rel)
+        if rel and remote_files is not None and bid in removed:
+            b.where = "removed"
+        books[bid] = b
+
+    # 4) 覆盖层字段、进度、最近打开
+    recent = [p for p in (recent or ()) if isinstance(p, str)]
+    recent_rank = {}
+    for i, p in enumerate(recent):
+        recent_rank.setdefault(norm_path(p), float(len(recent) - i))     # 越靠前（越新）数值越大
+    for bid, b in books.items():
+        meta = field_value(overlay, bid, "meta")
+        if isinstance(meta, dict) and meta.get("title"):
+            b.title = meta["title"]
+        b.fav = bool(field_value(overlay, bid, "fav", False))
+        b.hidden = bool(field_value(overlay, bid, "hidden", False))
+
+        cands = [bid]
+        if bid.startswith("remote:") and b.size:     # 先用本地读、后来才进云端书库的书：进度在 local: 别名下
+            cands.append(local_id_for(b.remote_rel, b.size))
+        best = None
+        for c in cands:
+            rec = digest.get(c) if isinstance(digest, dict) else None
+            if isinstance(rec, dict) and (best is None or rec.get("updated", 0) > best.get("updated", 0)):
+                best = rec
+        if best:
+            b.percent, b.progress_updated, b.progress_device = best.get("percent"), best.get("updated", 0.0), best.get("device", "")
+        bm_ts, bm_off = 0.0, 0.0
+        for p in b.local_paths:
+            ent = nbm.get(norm_path(p))
+            if ent:
+                bm_ts = max(bm_ts, _num(ent.get("_progress_ts_"), 0.0))
+                bm_off = max(bm_off, _num(ent.get("_progress_"), 0.0))
+        b.has_progress = bm_off > 0
+        seed = max([recent_rank.get(norm_path(p), 0.0) for p in b.local_paths] or [0.0])
+        b.last_opened = float(opened.get(bid, seed) or 0.0)
+        b.last_read = max(b.last_opened, b.progress_updated, bm_ts)
+
+    # 5) 「可能是同一本书」：仅限 local: 与 remote: 两种来源之间（同来源的同名书各自独立）
+    by_fp: Dict[str, List[Book]] = {}
+    for b in books.values():
+        if b.fp and b.where != "missing":
+            by_fp.setdefault(b.fp, []).append(b)
+    for grp in by_fp.values():
+        for b in grp:
+            kind = b.id.startswith("remote:")
+            b.same_as = sorted(o.id for o in grp if o.id.startswith("remote:") != kind)
+    return books
+
+
+# ================================================================== 过滤 / 排序
+SMART_SHELVES = ("all", "recent", "reading", "done", "fav", "removed", "uncategorized", "missing", "hidden")
+SORT_KEYS = ("last_read", "title", "added", "progress", "size")
+
+
+def _visible(b: Book) -> bool:
+    return not b.hidden and not b.auto_hidden
+
+
+def filter_books(books, shelf: str = "all", query: str = "") -> List[Book]:
+    """按智能书架 / 文件夹书架过滤，再按 query 做 casefold 子串匹配（书名、作者、文件名）。
+
+    智能书架：all 全部可见；recent 读过 / 打开过的；reading 在读；done 读完；fav 收藏；
+    removed 云端已移除（含默认隐藏的）；uncategorized 云端 library 根目录的书；
+    missing 其它设备的占位；hidden 我隐藏的。其余形如 cloud:<文件夹> / local:<路径> 的字符串按书架名精确匹配。"""
+    bs = list(books.values()) if isinstance(books, dict) else list(books)
+    if shelf == "all":
+        out = [b for b in bs if _visible(b)]
+    elif shelf == "recent":
+        out = [b for b in bs if _visible(b) and b.last_read > 0]
+    elif shelf == "reading":
+        out = [b for b in bs if _visible(b) and b.status == "reading"]
+    elif shelf == "done":
+        out = [b for b in bs if _visible(b) and b.status == "done"]
+    elif shelf == "fav":
+        out = [b for b in bs if b.fav and not b.hidden and not b.auto_hidden]
+    elif shelf == "removed":
+        out = [b for b in bs if b.removed and not b.hidden]
+    elif shelf == "uncategorized":
+        out = [b for b in bs if _visible(b) and b.shelf == CLOUD]
+    elif shelf == "missing":
+        out = [b for b in bs if b.placeholder and not b.hidden]
+    elif shelf == "hidden":
+        out = [b for b in bs if b.hidden]
+    else:
+        out = [b for b in bs if _visible(b) and b.shelf == shelf]
+    q = _nfc(query or "").casefold().strip()
+    if q:
+        out = [b for b in out if q in _nfc(b.title).casefold() or q in _nfc(b.author).casefold()
+               or q in _nfc(b.filename).casefold()]
+    return out
+
+
+def sort_books(books, key: str = "last_read") -> List[Book]:
+    """确定性排序（最后以 id 兜底）。last_read / added / progress / size 为降序，title 为升序（casefold）。"""
+    bs = list(books.values()) if isinstance(books, dict) else list(books)
+    if key == "title":
+        return sorted(bs, key=lambda b: (_nfc(b.title).casefold(), b.id))
+    if key == "added":
+        return sorted(bs, key=lambda b: (-b.mtime, _nfc(b.title).casefold(), b.id))
+    if key == "progress":
+        return sorted(bs, key=lambda b: (-(b.percent or 0.0), _nfc(b.title).casefold(), b.id))
+    if key == "size":
+        return sorted(bs, key=lambda b: (-b.size, _nfc(b.title).casefold(), b.id))
+    return sorted(bs, key=lambda b: (-b.last_read, _nfc(b.title).casefold(), b.id))
+
+
+# ================================================================== 覆盖层：校验
+def _parse_ts(x, now_ms: int):
+    """-> (ts, clamped)。ts 必须是正整数（或整数值的浮点）；其它返回 (None, False)。
+    超过 now+24h 的 ts 属于时钟异常，截断为 CLAMPED_TS（最旧）并返回 clamped=True。
+
+    与设计文档的偏差：§2.3 写的是「视为 now」。但「视为 now」是随时间前进的值：用户点击得到 ts=now+1，
+    下一次同步时对端那个异常值又被视为更晚的 now，把用户的点击压回去——字段仍被永久冻结。
+    截断成最旧值则与时间无关：异常值只在没有任何别的写入时才生效，用户随后的任何点击都能永久胜出，
+    并且 merge 仍满足结合律 / 幂等（截断结果是不动点）。"""
+    if isinstance(x, bool):
+        return None, False
+    if isinstance(x, float):
+        if not math.isfinite(x) or x != math.floor(x):
+            return None, False
+        x = int(x)
+    if not isinstance(x, int) or x <= 0:
+        return None, False
+    if x > now_ms + FUTURE_LIMIT_MS:
+        return CLAMPED_TS, True
+    return x, False
+
+
+def _parse_reg(raw, now_ms, dev_default, view):
+    """寄存器 [值, ts(, dev)] → (值, ts, dev, clamped) 或 None。"""
+    if not isinstance(raw, (list, tuple)) or len(raw) < 2:
+        return None
+    ts, clamped = _parse_ts(raw[1], now_ms)
+    if ts is None:
+        return None
+    dev = dev_default
+    if view and len(raw) >= 3:
+        d = safe_component(raw[2])
+        if d:
+            dev = d
+    if not dev:
+        return None
+    return raw[0], ts, dev, clamped
+
+
+def _clean_meta(v) -> Optional[dict]:
+    if not isinstance(v, dict):
+        return None
+    out = {}
+    fpv = v.get("fp")
+    if fpv is not None:
+        fpv = safe_component(fpv)
+        if fpv:
+            out["fp"] = fpv
+    t = _clean_str(v.get("title"))
+    if t:
+        out["title"] = t
+    return out or None
+
+
+def validate_overlay(raw, now_ms: Optional[int] = None, *, device_id: Optional[str] = None, view: bool = False):
+    """校验一份覆盖层内容（远端内容在合并前必须先过这里）。返回 (clean | None, issues)。
+
+    - device_id：写者，取自通过校验的文件名；给出时忽略 JSON 内的 device_id 与寄存器第三项。
+    - view=True：输入已是本模块产生的视图（寄存器第三项 dev 可信）。
+    - 不通过的条目 / 字段被跳过并写进 issues，不抛异常；整体类型不对或主版本过高返回 (None, issues)。
+    - ts：非数字 / 非整数 / <=0 → 丢弃该寄存器；> now+24h → 截断为最旧值（CLAMPED_TS）并把该设备记入 _clock。
+    - 条目数超过 MAX_ENTRIES 时按 id 排序取前 MAX_ENTRIES 个。"""
+    issues: List[str] = []
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    now_ms = int(now_ms)
+    if not isinstance(raw, dict):
+        return None, ["overlay: not an object"]
+    ver = raw.get("version", WIRE_VERSION)
+    if isinstance(ver, bool) or not isinstance(ver, int):
+        return None, ["overlay: bad version"]
+    if ver > WIRE_VERSION:
+        return None, [f"overlay: version {ver} is newer than supported"]
+    if device_id is not None:
+        dev = safe_component(device_id)
+        if not dev:
+            return None, ["overlay: bad device_id"]
+        view = False
+    else:
+        dev = safe_component(raw.get("device_id")) if raw.get("device_id") is not None else None
+        if raw.get("device_id") is not None and not dev:
+            return None, ["overlay: bad device_id"]
+        view = view or raw.get("_view") is True
+        if not dev and not view:
+            return None, ["overlay: missing device_id"]
+    now_s = now_ms / 1000.0
+    clock = set()
+    if view and isinstance(raw.get("_clock"), (list, tuple)):
+        clock.update(d for d in (safe_component(x) for x in raw["_clock"]) if d)
+
+    out_entries: Dict[str, dict] = {}
+    entries = raw.get("entries", {})
+    if not isinstance(entries, dict):
+        issues.append("entries: not an object")
+        entries = {}
+    bids = sorted(k for k in entries if isinstance(k, str))
+    if len(bids) > MAX_ENTRIES:
+        issues.append("entries: too many, truncated")
+        bids = bids[:MAX_ENTRIES]
+    for bid in bids:
+        ent = entries[bid]
+        if not valid_book_id(bid) or not isinstance(ent, dict):
+            issues.append(f"entry {bid[:60]!r}: skipped")
+            continue
+        clean: dict = {}
+        for fname in REG_FIELDS:
+            if fname not in ent:
+                continue
+            r = _parse_reg(ent[fname], now_ms, dev, view)
+            if r is None or not isinstance(r[0], bool):
+                issues.append(f"entry {bid[:60]!r}.{fname}: skipped")
+                continue
+            clean[fname] = [r[0], r[1], r[2]]
+            if r[3]:
+                clock.add(r[2])
+        if "meta" in ent:
+            r = _parse_reg(ent["meta"], now_ms, dev, view)
+            m = _clean_meta(r[0]) if r else None
+            if r is None or m is None:
+                issues.append(f"entry {bid[:60]!r}.meta: skipped")
+            else:
+                clean["meta"] = [m, r[1], r[2]]
+                if r[3]:
+                    clock.add(r[2])
+        if "rekeyed_from" in ent:
+            rk = ent["rekeyed_from"]
+            if isinstance(rk, (list, tuple)):
+                ids = sorted({x for x in rk if valid_book_id(x)})[:MAX_REKEYED]
+                if ids:
+                    clean["rekeyed_from"] = ids
+            else:
+                issues.append(f"entry {bid[:60]!r}.rekeyed_from: skipped")
+        for k, v in ent.items():              # 未知字段：原样保留（有界、不含 _ 开头的本地簿记键）
+            if k in KNOWN_ENTRY_KEYS or not isinstance(k, str) or not k or len(k) > 64 or k.startswith("_"):
+                continue
+            try:
+                if len(_canon(v)) <= MAX_EXTRA_BYTES:
+                    clean[k] = v
+            except (TypeError, ValueError):
+                pass
+        if clean:
+            out_entries[bid] = clean
+
+    out_prog: Dict[str, dict] = {}
+    prog = raw.get("progress", {})
+    if not isinstance(prog, dict):
+        issues.append("progress: not an object")
+        prog = {}
+    pids = sorted(k for k in prog if isinstance(k, str))
+    if len(pids) > MAX_ENTRIES:
+        issues.append("progress: too many, truncated")
+        pids = pids[:MAX_ENTRIES]
+    for bid in pids:
+        rec = prog[bid]
+        if not valid_book_id(bid) or not isinstance(rec, dict):
+            issues.append(f"progress {bid[:60]!r}: skipped")
+            continue
+        pct, upd = _num(rec.get("percent")), _num(rec.get("updated"))
+        if pct is None or upd is None or upd <= 0:
+            issues.append(f"progress {bid[:60]!r}: skipped")
+            continue
+        d = dev
+        if view:
+            d = safe_component(rec.get("device")) or dev
+        if not d:
+            continue
+        if upd > now_s + FUTURE_LIMIT_MS / 1000.0:
+            upd = CLAMPED_TS / 1000.0
+            clock.add(d)
+        out_prog[bid] = {"percent": min(100.0, max(0.0, pct)), "updated": upd, "device": d}
+
+    clean_ov = {"version": WIRE_VERSION, "_view": True, "entries": out_entries, "progress": out_prog,
+                "_clock": sorted(clock)}
+    if dev:
+        clean_ov["device_id"] = dev
+    if device_id is not None or not view:           # 本设备 / 远端设备文件才有这些元信息；合并视图没有
+        h = _clean_str(raw.get("hostname"), 64)
+        u = safe_component(raw.get("user")) if raw.get("user") is not None else None
+        if h:
+            clean_ov["hostname"] = h
+        if u:
+            clean_ov["user"] = u
+    return clean_ov, issues
+
+
+# ================================================================== 覆盖层：合并
+def _reg_key(reg):
+    return (reg[1], reg[2], _canon(reg[0]))
+
+
+def merge(*overlays, now_ms: Optional[int] = None) -> dict:
+    """合并任意多份覆盖层（原始内容或视图），返回视图。满足交换律、结合律、幂等（now_ms 相同时）。
+
+    规则（design §2.3）：
+      fav / hidden / meta：LWW 寄存器，ts 大者胜，ts 相同则 device_id 字典序大者胜
+                           （仍相同则按值的规范化 JSON 比较，保证全序）；
+      rekeyed_from：并集；
+      progress：按 book_id，updated 大者胜，平局 device 大者胜；
+      未知字段：不参与合并，取规范化 JSON 最大者（确定性，且满足上面三条性质）。
+    每份输入先过 validate_overlay：非法条目被跳过，超前 24 小时的 ts 截断为最旧值并记入 _clock。
+    注意：未经校验的远端原始 JSON 请先用 validate_overlay(raw, device_id=<文件名>) 处理。"""
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    entries: Dict[str, dict] = {}
+    progress: Dict[str, dict] = {}
+    clock = set()
+    for ov in overlays:
+        if isinstance(ov, dict) and ov.get("_view") is True:
+            clean, _ = validate_overlay(ov, now_ms, view=True)
+        else:
+            clean, _ = validate_overlay(ov, now_ms)
+        if clean is None:
+            continue
+        clock.update(clean["_clock"])
+        for bid, ent in clean["entries"].items():
+            cur = entries.setdefault(bid, {})
+            for k, v in ent.items():
+                if k in REG_FIELDS or k == "meta":
+                    if k not in cur or _reg_key(v) > _reg_key(cur[k]):
+                        cur[k] = v
+                elif k == "rekeyed_from":
+                    cur[k] = sorted(set(cur.get(k, ())) | set(v))[:MAX_REKEYED]
+                else:
+                    if k not in cur or _canon(v) > _canon(cur[k]):
+                        cur[k] = v
+        for bid, rec in clean["progress"].items():
+            old = progress.get(bid)
+            key = (rec["updated"], rec["device"], rec["percent"])
+            if old is None or key > (old["updated"], old["device"], old["percent"]):
+                progress[bid] = rec
+    return {"version": WIRE_VERSION, "_view": True, "entries": entries, "progress": progress,
+            "_clock": sorted(clock)}
+
+
+# ================================================================== 覆盖层：本地编辑
+def new_overlay(device_id: str, hostname: str = "", user: str = "") -> dict:
+    """本设备的空覆盖层（视图形式，写者 = device_id）。"""
+    dev = safe_component(device_id)
+    if not dev:
+        raise ValueError("bad device_id")
+    ov = {"version": WIRE_VERSION, "_view": True, "device_id": dev, "entries": {}, "progress": {},
+          "_clock": [], "_rev": 0}
+    if hostname and _clean_str(hostname, 64):
+        ov["hostname"] = _clean_str(hostname, 64)
+    if user and safe_component(user):
+        ov["user"] = safe_component(user)
+    return ov
+
+
+def effective_ts(view: Optional[dict], bid: str, name: str, now_ms: int) -> int:
+    """视图里某寄存器的有效 ts；超过 now+24h 的视为最旧值（CLAMPED_TS）；没有则 0。"""
+    reg = ((view or {}).get("entries", {}).get(bid) or {}).get(name)
+    if isinstance(reg, (list, tuple)) and len(reg) >= 2:
+        ts, _ = _parse_ts(reg[1], now_ms)
+        return ts or 0
+    return 0
+
+
+def set_field(ov: dict, bid: str, name: str, value, *, merged: Optional[dict] = None,
+              now_ms: Optional[int] = None, skew_ms: int = 0, meta: Optional[dict] = None) -> int:
+    """本设备写一个字段（fav / hidden），返回写入的 ts。混合逻辑时钟：
+         ts = max(now_ms + skew_ms, effective_ts(合并后的值) + 1)
+    其中 effective_ts 取自 merged（含所有设备的合并视图；缺省则只看 ov 自身），所以用户的点击总能压过
+    他当时看到的值；对端 ts 超过 now+24h 视为最旧值（坏时钟不能永久冻结字段，见 _parse_ts）。
+    meta={"fp":..., "title":...}：若合并视图里还没有等值的 meta，则同时写一个 meta 寄存器。
+    会让 ov["_rev"] += 1。参数非法抛 ValueError（编程错误，不是网络错误）。"""
+    dev = safe_component(ov.get("device_id")) if isinstance(ov, dict) else None
+    if not dev:
+        raise ValueError("overlay has no device_id")
+    if name not in REG_FIELDS:
+        raise ValueError(f"unknown field {name!r}")
+    if not isinstance(value, bool):
+        raise ValueError("value must be bool")
+    if not valid_book_id(bid):
+        raise ValueError("bad book id")
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    now_ms = int(now_ms)
+    base = now_ms + int(skew_ms)
+    ents = ov.setdefault("entries", {})
+    if bid not in ents and len(ents) >= MAX_ENTRIES:
+        raise ValueError("too many overlay entries")
+
+    def _eff(field_name):
+        return max(effective_ts(ov, bid, field_name, base), effective_ts(merged, bid, field_name, base))
+
+    ts = max(base, _eff(name) + 1)
+    ent = ents.setdefault(bid, {})
+    ent[name] = [value, ts, dev]
+    if meta is not None:
+        m = _clean_meta(meta)
+        if m:
+            cur = field_value(merged, bid, "meta")
+            if cur is None:
+                cur = field_value(ov, bid, "meta")
+            if cur != m:
+                ent["meta"] = [m, max(base, _eff("meta") + 1), dev]
+    ov["_rev"] = int(ov.get("_rev", 0)) + 1
+    return ts
+
+
+def set_progress(ov: dict, bid: str, percent: float, updated: Optional[float] = None) -> None:
+    """记录本设备对某本书的进度摘要（design §4.3 progress 段；来自主线程的阅读事件）。"""
+    dev = safe_component(ov.get("device_id")) if isinstance(ov, dict) else None
+    if not dev or not valid_book_id(bid):
+        raise ValueError("bad overlay or book id")
+    p = _num(percent)
+    if p is None:
+        raise ValueError("bad percent")
+    prog = ov.setdefault("progress", {})
+    if bid not in prog and len(prog) >= MAX_ENTRIES:
+        raise ValueError("too many progress entries")
+    prog[bid] = {"percent": min(100.0, max(0.0, p)),
+                 "updated": float(updated if updated is not None else time.time()), "device": dev}
+    ov["_rev"] = int(ov.get("_rev", 0)) + 1
+
+
+# ================================================================== 上传白名单
+def to_wire(ov: dict, device_id: Optional[str] = None) -> dict:
+    """上传内容只能由本函数构造：白名单 version / device_id / hostname / user / entries{meta,fav,hidden} / progress。
+    以 _ 开头的键、未知字段、rekeyed_from、本机路径、配置里的任何东西一律不出现。
+    只输出写者为本设备的寄存器 / 进度（别的设备的值由它自己的文件负责）。"""
+    dev = safe_component(device_id if device_id is not None else (ov or {}).get("device_id"))
+    if not dev:
+        raise ValueError("overlay has no device_id")
+    wire = {"version": WIRE_VERSION, "device_id": dev}
+    h = _clean_str(ov.get("hostname"), 64)
+    if h:
+        wire["hostname"] = h
+    u = safe_component(ov.get("user")) if ov.get("user") is not None else None
+    if u:
+        wire["user"] = u
+    ents: Dict[str, dict] = {}
+    src = ov.get("entries") if isinstance(ov.get("entries"), dict) else {}
+    for bid in sorted(k for k in src if isinstance(k, str)):
+        ent = src[bid]
+        if not valid_book_id(bid) or not isinstance(ent, dict):
+            continue
+        out = {}
+        for fname in REG_FIELDS:
+            reg = ent.get(fname)
+            if (isinstance(reg, (list, tuple)) and len(reg) >= 2 and isinstance(reg[0], bool)
+                    and isinstance(reg[1], int) and not isinstance(reg[1], bool) and reg[1] > 0
+                    and (len(reg) < 3 or reg[2] == dev)):
+                out[fname] = [reg[0], reg[1]]
+        reg = ent.get("meta")
+        if (isinstance(reg, (list, tuple)) and len(reg) >= 2 and isinstance(reg[1], int)
+                and not isinstance(reg[1], bool) and reg[1] > 0 and (len(reg) < 3 or reg[2] == dev)):
+            m = _clean_meta(reg[0])
+            if m:
+                out["meta"] = [m, reg[1]]
+        if out:
+            ents[bid] = out
+    wire["entries"] = ents
+    prog: Dict[str, dict] = {}
+    psrc = ov.get("progress") if isinstance(ov.get("progress"), dict) else {}
+    for bid in sorted(k for k in psrc if isinstance(k, str)):
+        rec = psrc[bid]
+        if not valid_book_id(bid) or not isinstance(rec, dict) or rec.get("device", dev) != dev:
+            continue
+        pct, upd = _num(rec.get("percent")), _num(rec.get("updated"))
+        if pct is None or upd is None or upd <= 0:
+            continue
+        prog[bid] = {"percent": min(100.0, max(0.0, pct)), "updated": upd}
+    wire["progress"] = prog
+    return wire
+
+
+def wire_bytes(ov: dict, device_id: Optional[str] = None) -> bytes:
+    """to_wire 的规范化 UTF-8 JSON（键排序）。"""
+    return json.dumps(to_wire(ov, device_id), sort_keys=True, ensure_ascii=False, indent=1).encode("utf-8")
+
+
+def wire_hash(ov: dict, device_id: Optional[str] = None) -> str:
+    """上传内容的 sha1（state.json 的 pushed_hash）。"""
+    return hashlib.sha1(_canon(to_wire(ov, device_id)).encode("utf-8")).hexdigest()
+
+
+# ================================================================== 本机存储（~/.pyreader/shelf/）
+def shelf_dir(root: Optional[str] = None) -> str:
+    return os.path.join(root or _default_root(), "shelf")
+
+
+def state_path(root=None) -> str:
+    return os.path.join(shelf_dir(root), "state.json")
+
+
+def overlay_path(root=None) -> str:
+    return os.path.join(shelf_dir(root), "overlay.json")
+
+
+def index_path(root=None) -> str:
+    return os.path.join(shelf_dir(root), "index.json")
+
+
+def peers_dir(root=None) -> str:
+    return os.path.join(shelf_dir(root), "peers")
+
+
+def new_device_id() -> str:
+    """hostname + 6 位随机十六进制；首次生成后固定。"""
+    return f"{_hostname()}-{secrets.token_hex(3)}"
+
+
+DEFAULT_UI = {"view": "grid", "sort": "last_read", "collapsed": [], "last_shelf": "all", "start_in_shelf": False}
+
+
+def _int(x, default, lo=None, hi=None):
+    if isinstance(x, bool) or not isinstance(x, int):
+        return default
+    if lo is not None and x < lo:
+        return default
+    if hi is not None and x > hi:
+        return default
+    return x
+
+
+def _clean_ui(ui) -> dict:
+    ui = ui if isinstance(ui, dict) else {}
+    out = dict(DEFAULT_UI)
+    if ui.get("view") in ("grid", "list"):
+        out["view"] = ui["view"]
+    if ui.get("sort") in SORT_KEYS:
+        out["sort"] = ui["sort"]
+    if isinstance(ui.get("collapsed"), list):
+        out["collapsed"] = [s[:MAX_STR] for s in ui["collapsed"] if isinstance(s, str)][:500]
+    if isinstance(ui.get("last_shelf"), str) and ui["last_shelf"]:
+        out["last_shelf"] = ui["last_shelf"][:MAX_STR]
+    if isinstance(ui.get("start_in_shelf"), bool):
+        out["start_in_shelf"] = ui["start_in_shelf"]
+    return out
+
+
+def _clean_stamp(st):
+    if not isinstance(st, dict):
+        return None
+    mt, sz = _num(st.get("mtime")), _int(st.get("size"), None, 0)
+    if mt is None or sz is None:
+        return None
+    out = {"mtime": mt, "size": sz}
+    if isinstance(st.get("etag"), str):
+        out["etag"] = st["etag"][:256]
+    return out
+
+
+def _clean_cursors(cur) -> dict:
+    cur = cur if isinstance(cur, dict) else {}
+    peers = {}
+    for k, v in (cur.get("peers") if isinstance(cur.get("peers"), dict) else {}).items():
+        if safe_component(k) and isinstance(v, dict):
+            st = _clean_stamp(v)
+            if st:
+                ft = _num(v.get("fetched_at"))
+                if ft is not None:
+                    st["fetched_at"] = ft
+                peers[k] = st
+    return {"peers": peers, "rounds_since_full": _int(cur.get("rounds_since_full"), 0, 0)}
+
+
+def default_state(device_id: Optional[str] = None) -> dict:
+    return {"version": STATE_VERSION, "device_id": device_id or new_device_id(), "clock_skew_ms": 0,
+            "confirmed_upload": False, "pushed_rev": 0, "pushed_hash": "", "remote_stamp": None,
+            "ui": dict(DEFAULT_UI, collapsed=[]), "cursors": {"peers": {}, "rounds_since_full": 0}}
+
+
+def load_state(root: Optional[str] = None) -> dict:
+    """读 state.json：缺失字段补默认值、类型不对的字段回退默认；损坏文件被 load_json 隔离为 .bad-<ts>。
+    首次生成 device_id 后立即落盘（固定下来）。主版本高于本程序时返回 _readonly=True，save_state 将拒绝写。
+    未知字段原样保留。"""
+    path = state_path(root)
+    raw = load_json(path, None, dict)
+    if raw is None:
+        st = default_state()
+        try:
+            save_json(path, _persist_form(st))
+        except OSError:
+            pass
+        return st
+    ver = raw.get("version", STATE_VERSION)
+    st = {k: v for k, v in raw.items() if isinstance(k, str) and not k.startswith("_")}
+    dev = safe_component(raw.get("device_id"))
+    fresh = dev is None
+    st["version"] = _int(ver, STATE_VERSION, 1)
+    st["device_id"] = dev or new_device_id()
+    st["clock_skew_ms"] = _int(raw.get("clock_skew_ms"), 0, -FUTURE_LIMIT_MS, FUTURE_LIMIT_MS)
+    st["confirmed_upload"] = raw.get("confirmed_upload") is True
+    st["pushed_rev"] = _int(raw.get("pushed_rev"), 0, 0)
+    st["pushed_hash"] = raw["pushed_hash"][:64] if isinstance(raw.get("pushed_hash"), str) else ""
+    st["remote_stamp"] = _clean_stamp(raw.get("remote_stamp"))
+    st["ui"] = _clean_ui(raw.get("ui"))
+    st["cursors"] = _clean_cursors(raw.get("cursors"))
+    if st["version"] > STATE_VERSION:
+        st["_readonly"] = True               # 更高主版本：只读不写
+    elif fresh:
+        try:
+            save_json(path, _persist_form(st))
+        except OSError:
+            pass
+    return st
+
+
+def _persist_form(st: dict) -> dict:
+    return {k: v for k, v in st.items() if not k.startswith("_")}
+
+
+def save_state(st: dict, root: Optional[str] = None) -> bool:
+    """原子写 state.json（不写 _ 开头的内存字段）。只读状态返回 False。"""
+    if st.get("_readonly"):
+        return False
+    save_json(state_path(root), _persist_form(st))
+    return True
+
+
+def load_overlay(root: Optional[str] = None, device_id: Optional[str] = None, hostname: str = "", user: str = "") -> dict:
+    """读本设备的 overlay.json；不存在视为空（version=1）。损坏文件被隔离后返回空覆盖层；
+    主版本过高返回空覆盖层并带 _readonly=True（save_overlay 拒绝写）。device_id 缺省取 state.json 的。"""
+    dev = device_id or load_state(root)["device_id"]
+    raw = load_json(overlay_path(root), None, dict)
+    if raw is None:
+        return new_overlay(dev, hostname or _hostname(), user)
+    clean, _issues = validate_overlay(raw, device_id=dev)
+    if clean is None:
+        ver = raw.get("version")
+        ov = new_overlay(dev, hostname or _hostname(), user)
+        if isinstance(ver, int) and not isinstance(ver, bool) and ver > WIRE_VERSION:
+            ov["_readonly"] = True
+        return ov
+    clean.setdefault("hostname", hostname or _hostname())
+    if user and "user" not in clean and safe_component(user):
+        clean["user"] = safe_component(user)
+    clean["_rev"] = 0
+    return clean
+
+
+def save_overlay(ov: dict, root: Optional[str] = None) -> bool:
+    """原子写 overlay.json（内容 = to_wire，同时就是上传内容）。只读状态返回 False。"""
+    if ov.get("_readonly"):
+        return False
+    save_json(overlay_path(root), to_wire(ov))
+    return True
