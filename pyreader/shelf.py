@@ -1059,3 +1059,213 @@ def save_overlay(ov: dict, root: Optional[str] = None) -> bool:
         return False
     save_json(overlay_path(root), to_wire(ov))
     return True
+
+
+# ================================================================== 阶段 2：封面 / 进度快照 / index.json 缓存
+INDEX_VERSION = 1
+MAX_PATH_STR = 1024                       # index.json 里本地路径的长度上限
+MAX_LOCAL_PATHS = 20                      # 一本书（同名同大小拷贝）最多缓存的路径数
+MAX_NOTES = SCAN_LIMIT                    # 本机记录的「打开时间 / 进度百分比」条数上限（超出保留最新的）
+_WHERE = ("local", "synced", "cloud", "removed", "missing")
+
+
+def _is_cjk(c: str) -> bool:
+    o = ord(c)
+    return 0x2E80 <= o <= 0x9FFF or 0xF900 <= o <= 0xFAFF or 0x3040 <= o <= 0x30FF or 0xAC00 <= o <= 0xD7AF
+
+
+def cover_hsl(fp_hint: str, title: str = "") -> tuple:
+    """色块封面的颜色：由 fp（缺省退回书名）的哈希确定性地取 (色相 0-359, 饱和度, 明度)。
+    明度压在中低区间，保证白色书名在任何色相上都可读。"""
+    seed = fp_hint if isinstance(fp_hint, str) and fp_hint else _nfc(title or "?")
+    d = hashlib.sha1(seed.encode("utf-8", "replace")).digest()
+    hue = int.from_bytes(d[:2], "big") % 360
+    sat = 90 + d[2] % 60                  # 90..149（/255）
+    light = 70 + d[3] % 40                # 70..109（/255）
+    return hue, sat, light
+
+
+def cover_glyph(title: str) -> str:
+    """封面上的大字：CJK 书名取前两字；拉丁书名取前几个单词的首字母（最多 3 个，大写）。"""
+    t = "".join(c for c in _nfc(title or "") if unicodedata.category(c) not in ("Cc", "Cs") and c not in _BIDI).strip()
+    if not t:
+        return "?"
+    if _is_cjk(t[0]):
+        return t[:2]
+    words = re.findall(r"[^\W_]+", t)
+    if not words:
+        return t[:2]
+    if len(words) == 1:
+        return words[0][:3].upper()
+    return "".join(w[0] for w in words[:3]).upper()
+
+
+def bookmark_snapshot(bookmarks) -> Dict[str, dict]:
+    """给后台线程用的书签快照：只取 _progress_ / _progress_ts_（主线程拷贝，之后不再共享可变的 bookmarks）。"""
+    out: Dict[str, dict] = {}
+    if not isinstance(bookmarks, dict):
+        return out
+    for k, v in list(bookmarks.items()):
+        if isinstance(k, str) and isinstance(v, dict):
+            out[k] = {"_progress_": v.get("_progress_"), "_progress_ts_": v.get("_progress_ts_")}
+    return out
+
+
+def progress_overlay(progress: Optional[dict]) -> dict:
+    """把本机记录的进度百分比 {book_id: {percent, updated, device}} 包成 build_books 认的「覆盖层视图」。
+    不是覆盖层本身（不写 overlay.json、不上传）：阶段 4 起这一段由设备文件的 progress 摘要取代。"""
+    return {"version": WIRE_VERSION, "_view": True, "entries": {}, "progress": dict(progress or {})}
+
+
+def note_opened(b: Book, ts: float) -> None:
+    """记一次「打开」：last_opened 与 last_read 取较大者（就地更新，不重建索引）。"""
+    b.last_opened = max(b.last_opened, float(ts))
+    b.last_read = max(b.last_read, b.last_opened)
+
+
+def note_progress(b: Book, percent: float, updated: float, device: str = "") -> bool:
+    """记一次阅读进度（就地更新）。比已有记录旧则忽略，返回是否生效。"""
+    p, u = _num(percent), _num(updated)
+    if p is None or u is None or p < 0:
+        return False
+    if u < b.progress_updated:
+        return False
+    b.percent = min(100.0, p)
+    b.progress_updated = u
+    b.progress_device = _clean_str(device, 64) or ""
+    b.has_progress = b.has_progress or p > 0
+    b.last_read = max(b.last_read, u)
+    return True
+
+
+def _trim_notes(d: dict, key) -> dict:
+    """只保留最新的 MAX_NOTES 条（key(v) 取排序用的时间）。"""
+    if len(d) <= MAX_NOTES:
+        return dict(d)
+    keep = sorted(d.items(), key=lambda kv: -key(kv[1]))[:MAX_NOTES]
+    return dict(keep)
+
+
+def index_to_wire(books: Dict[str, Book], opened: Optional[dict] = None, progress: Optional[dict] = None,
+                  built: Optional[float] = None) -> dict:
+    """派生索引（可随时删除、可重建）。只写本机有文件的书；opened / progress 是本机独有的记录
+    （书籍扫描会整体替换 books，这两份不能从扫描里重建，所以随索引一起落盘）。"""
+    entries = {}
+    for bid, b in sorted(books.items()):
+        if not b.local_paths or not valid_book_id(bid):
+            continue
+        e = {"fp": b.fp, "title": b.title, "format": b.fmt, "size": int(b.size), "shelf": b.shelf,
+             "where": b.where, "mtime": float(b.mtime), "local": list(b.local_paths[:MAX_LOCAL_PATHS]),
+             "has_progress": bool(b.has_progress), "last_read": float(b.last_read)}
+        if b.remote_rel:
+            e["remote"] = {"rel": b.remote_rel}
+        entries[bid] = e
+    op = _trim_notes({k: float(v) for k, v in (opened or {}).items() if valid_book_id(k) and _num(v) is not None},
+                     lambda v: v)
+    pg = {}
+    for k, v in (progress or {}).items():
+        if not valid_book_id(k) or not isinstance(v, dict):
+            continue
+        p, u = _num(v.get("percent")), _num(v.get("updated"))
+        if p is None or u is None:
+            continue
+        pg[k] = {"percent": min(100.0, max(0.0, p)), "updated": u, "device": _clean_str(v.get("device"), 64) or ""}
+    pg = _trim_notes(pg, lambda v: v["updated"])
+    return {"version": INDEX_VERSION, "built": float(built if built is not None else time.time()),
+            "books": entries, "opened": op, "progress": pg}
+
+
+def _clean_path(p) -> Optional[str]:
+    if not isinstance(p, str) or not p or len(p) > MAX_PATH_STR or not _encodable(p) or "\x00" in p:
+        return None
+    return p
+
+
+def index_from_wire(raw):
+    """校验并还原 index.json：返回 (books, opened, progress)；无法使用（类型不对 / 主版本更高）返回 None。
+    坏条目逐条跳过，不抛异常；还原出的书一律没有 same_as（那是扫描的产物）。"""
+    if not isinstance(raw, dict):
+        return None
+    ver = raw.get("version")
+    if isinstance(ver, bool) or not isinstance(ver, int) or ver < 1 or ver > INDEX_VERSION:
+        return None
+    books: Dict[str, Book] = {}
+    ents = raw.get("books")
+    if isinstance(ents, dict):
+        for bid, e in list(ents.items())[:MAX_NOTES]:
+            if not valid_book_id(bid) or not isinstance(e, dict):
+                continue
+            lp = e.get("local") if isinstance(e.get("local"), list) else []
+            paths = [q for q in (_clean_path(p) for p in lp[:MAX_LOCAL_PATHS]) if q]
+            title = _clean_str(e.get("title"))
+            if not paths or not title:
+                continue
+            size = e.get("size")
+            where = e.get("where") if e.get("where") in _WHERE else "local"
+            rem = e.get("remote") if isinstance(e.get("remote"), dict) else {}
+            rel = rem.get("rel") if valid_remote_rel(rem.get("rel")) else ""
+            b = Book(bid, title, _clean_str(e.get("format"), 16) or "",
+                     size if isinstance(size, int) and not isinstance(size, bool) and 0 <= size < 2 ** 53 else 0,
+                     _clean_str(e.get("shelf"), MAX_PATH_STR) or "", _clean_str(e.get("fp"), 64) or "", where, rel,
+                     _num(e.get("mtime"), 0.0), paths)
+            b.has_progress = e.get("has_progress") is True
+            b.last_read = max(0.0, _num(e.get("last_read"), 0.0))
+            books[bid] = b
+    opened: Dict[str, float] = {}
+    if isinstance(raw.get("opened"), dict):
+        for k, v in list(raw["opened"].items())[:MAX_NOTES]:
+            f = _num(v)
+            if valid_book_id(k) and f is not None and f > 0:
+                opened[k] = f
+    progress: Dict[str, dict] = {}
+    if isinstance(raw.get("progress"), dict):
+        for k, v in list(raw["progress"].items())[:MAX_NOTES]:
+            if not valid_book_id(k) or not isinstance(v, dict):
+                continue
+            p, u = _num(v.get("percent")), _num(v.get("updated"))
+            if p is None or u is None or p < 0:
+                continue
+            progress[k] = {"percent": min(100.0, p), "updated": u, "device": _clean_str(v.get("device"), 64) or ""}
+    for bid, b in books.items():             # 进度百分比是独立缓存：还原到书上
+        rec = progress.get(bid)
+        if rec:
+            b.percent, b.progress_updated, b.progress_device = rec["percent"], rec["updated"], rec["device"]
+            b.last_read = max(b.last_read, rec["updated"])
+        if bid in opened:
+            b.last_opened = opened[bid]
+            b.last_read = max(b.last_read, b.last_opened)
+    return books, opened, progress
+
+
+def load_index(root: Optional[str] = None):
+    """读 index.json。不存在 → None；损坏 → 被 load_json 隔离为 .bad-<ts> 后返回 None（索引可重建，不丢数据）；
+    主版本更高 → 返回 None，且 index_readonly(root) 为真。"""
+    raw = load_json(index_path(root), None, dict)
+    return index_from_wire(raw) if raw is not None else None
+
+
+def index_readonly(root: Optional[str] = None) -> bool:
+    """磁盘上的 index.json 来自更高主版本：本程序只读不写（避免降级覆盖）。"""
+    try:
+        with open(index_path(root), "rb") as f:
+            raw = json.loads(f.read().decode("utf-8-sig"))
+    except (OSError, ValueError):
+        return False
+    ver = raw.get("version") if isinstance(raw, dict) else None
+    return isinstance(ver, int) and not isinstance(ver, bool) and ver > INDEX_VERSION
+
+
+def save_index(books, opened=None, progress=None, root: Optional[str] = None) -> bool:
+    """原子写 index.json。更高主版本的文件不覆盖，返回 False。"""
+    if index_readonly(root):
+        return False
+    save_json(index_path(root), index_to_wire(books, opened, progress))
+    return True
+
+
+def reset_index(root: Optional[str] = None) -> None:
+    """删除 index.json（派生缓存）。其它书架文件（state.json / overlay.json / peers/）不动。"""
+    try:
+        os.remove(index_path(root))
+    except OSError:
+        pass
