@@ -393,6 +393,39 @@ def test_validate_strings_sanitised_and_bounded():
     assert c["entries"][BID_R2] == {"ok": {"a": 1}}                           # 超长未知字段丢弃
 
 
+LONE_SURROGATE_JSON = r'''{
+  "version": 1, "device_id": "dev-b", "hostname": "h\ud800", "user": "u\ud800",
+  "entries": {
+    "remote:a.txt": {"fav": [true, 5], "meta": [{"title": "x\ud800y"}, 5], "zz": "q\ud800",
+                     "nest": {"k\ud800": 1}, "bad\ud800key": 1, "ok": {"a": 1},
+                     "rekeyed_from": ["remote:r\ud800.txt", "remote:r2.txt"]},
+    "remote:b\ud800.txt": {"fav": [true, 5]}
+  },
+  "progress": {"remote:a.txt": {"percent": 1, "updated": 5, "device": "d\ud800"},
+               "remote:c\ud800.txt": {"percent": 1, "updated": 5}}
+}'''
+
+
+def test_validate_lone_surrogates_never_break_serialisation(tmp_path):
+    """json.loads 接受孤立代理项（U+D800）；它们不得进入合并视图，否则 save_json / wire_bytes 抛 UnicodeEncodeError。"""
+    raw = json.loads(LONE_SURROGATE_JSON)
+    assert "\ud800" in raw["hostname"] and "\ud800" in raw["entries"]["remote:a.txt"]["meta"][0]["title"]   # 前提
+    c, _ = validate_overlay(raw, NOW, device_id="dev-b")
+    ent = c["entries"]["remote:a.txt"]
+    assert ent["meta"][0]["title"] == "xy" and ent["ok"] == {"a": 1}      # 标题清洗后保留，其余坏字段丢弃
+    assert c.get("hostname") == "h" and "user" not in c
+    assert not any(k in ent for k in ("zz", "nest", "bad\ud800key"))
+    assert ent["rekeyed_from"] == ["remote:r2.txt"]
+    assert list(c["entries"]) == ["remote:a.txt"] and c["progress"]["remote:a.txt"]["device"] == "dev-b"
+    assert list(c["progress"]) == ["remote:a.txt"]
+    m = merge(raw, now_ms=NOW)
+    store.save_json(tmp_path / "index.json", m)                              # 不抛
+    shelf.wire_bytes(m, "dev-b")                                             # 不抛
+    json.dumps(m, ensure_ascii=False).encode("utf-8")
+    assert shelf._clean_str("a\ud800b") == "ab"
+    assert shelf.new_overlay("dev-a", "h\ud800x").get("hostname") == "hx"
+
+
 def test_validate_entry_count_cap():
     ents = {f"remote:b/{i:06d}.txt": {"fav": [True, 5]} for i in range(shelf.MAX_ENTRIES + 10)}
     c, issues = validate_overlay(ov_of("pc", ents), NOW)

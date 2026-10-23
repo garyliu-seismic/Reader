@@ -63,11 +63,20 @@ def _nfc(s: str) -> str:
     return unicodedata.normalize("NFC", s)
 
 
+def _encodable(s) -> bool:
+    """字符串能否无损编码为 UTF-8（孤立代理项（如 U+D800）会让 json.loads 通过、写盘 / 上传时抛 UnicodeEncodeError）。"""
+    try:
+        s.encode("utf-8")
+        return True
+    except UnicodeError:
+        return False
+
+
 def _clean_str(s, limit=MAX_STR) -> Optional[str]:
-    """去掉控制字符与 bidi 控制字符、截断到 limit。非字符串返回 None。"""
+    """去掉控制字符、代理项（Cs）与 bidi 控制字符、截断到 limit。非字符串返回 None。"""
     if not isinstance(s, str):
         return None
-    s = "".join(c for c in s if unicodedata.category(c) != "Cc" and c not in _BIDI)
+    s = "".join(c for c in s if unicodedata.category(c) not in ("Cc", "Cs") and c not in _BIDI)
     return s[:limit]
 
 
@@ -126,7 +135,7 @@ def local_id_for(name: str, size: int) -> str:
 
 def valid_book_id(bid) -> bool:
     """book_id 只能是 remote:<合法 rel> 或 local:<40 位小写十六进制>。"""
-    if not isinstance(bid, str) or len(bid) > 1100:
+    if not isinstance(bid, str) or len(bid) > 1100 or not _encodable(bid):
         return False
     if bid.startswith("remote:"):
         rel = bid[7:]
@@ -639,7 +648,8 @@ def validate_overlay(raw, now_ms: Optional[int] = None, *, device_id: Optional[s
             if k in KNOWN_ENTRY_KEYS or not isinstance(k, str) or not k or len(k) > 64 or k.startswith("_"):
                 continue
             try:
-                if len(_canon(v)) <= MAX_EXTRA_BYTES:
+                c = _canon(v)
+                if _encodable(k) and _encodable(c) and len(c) <= MAX_EXTRA_BYTES:   # 含孤立代理项的键 / 值（含嵌套）丢弃
                     clean[k] = v
             except (TypeError, ValueError):
                 pass
