@@ -52,7 +52,8 @@ def book_id(path: str) -> str:
 
 
 def _safe_name(bid: str) -> str:
-    return re.sub(r"[^0-9A-Za-z._-]", "_", bid)[:180]
+    # 不能把非 ASCII 字符替换成 "_"：不同的中文书名会得到同一个文件名而互相覆盖进度
+    return hashlib.sha1(bid.encode("utf-8")).hexdigest()[:20]
 
 
 def progress_path(user: str, bid: str) -> str:
@@ -85,7 +86,9 @@ def pull_progress(client: WebDavClient, user: str, bid: str) -> Optional[dict]:
         return None
     try:
         d = json.loads(client.get(p).decode("utf-8"))
-        return d if isinstance(d, dict) and "offset" in d else None
+        if isinstance(d, dict) and "offset" in d and d.get("book_id") == bid:
+            return d
+        return None
     except (ValueError, UnicodeDecodeError):
         return None
 

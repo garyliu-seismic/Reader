@@ -233,13 +233,30 @@ def test_progress_push_pull_roundtrip(server):
     c = WebDavClient(url)
     rec = sync.make_record("local:abc", 123, 4.5, "第一章", "pc", updated=1234.5)
     sync.push_progress(c, "alice", rec)
-    assert "/dav/users/alice/progress/local_abc.json" in h.files
+    key = "/dav/" + sync.progress_path("alice", "local:abc")
+    assert key in h.files
     assert sync.pull_progress(c, "alice", "local:abc") == rec
     assert sync.pull_progress(c, "alice", "local:none") is None
     assert sync.pull_progress(c, "bob", "local:abc") is None   # 用户隔离
     # 远端文件里不得出现配置/密码字段
-    blob = h.files["/dav/users/alice/progress/local_abc.json"].decode()
+    blob = h.files[key].decode()
     assert set(json.loads(blob)) == {"book_id", "offset", "percent", "chapter", "updated", "device"}
+
+
+def test_progress_filename_no_collision_for_non_ascii_titles(server):
+    """不同的中文书名必须得到不同的进度文件，且文件内 book_id 不符时被忽略。"""
+    h, url = server
+    c = WebDavClient(url)
+    ids = ["remote:小说/三体.epub", "remote:小说/红楼.epub", "remote:科幻/沙丘.epub"]
+    assert len({sync.progress_path("alice", b) for b in ids}) == 3
+    for i, b in enumerate(ids):
+        sync.push_progress(c, "alice", sync.make_record(b, 100 + i, 1.0, "", "pc", updated=10.0 + i))
+    for i, b in enumerate(ids):
+        assert sync.pull_progress(c, "alice", b)["offset"] == 100 + i
+    # 文件名碰撞/被篡改：文件体 book_id 与请求不符 -> 忽略
+    h.files["/dav/" + sync.progress_path("alice", ids[0])] = json.dumps(
+        sync.make_record(ids[1], 1, 1.0, "", "pc")).encode()
+    assert sync.pull_progress(c, "alice", ids[0]) is None
 
 
 # ---------------- no-op / failure ----------------
