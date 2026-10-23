@@ -1,5 +1,7 @@
 from PySide6.QtWidgets import (QDialog, QComboBox, QLineEdit, QCheckBox, QDoubleSpinBox,
-                               QSpinBox, QFormLayout, QDialogButtonBox, QLabel)
+                               QSpinBox, QFormLayout, QDialogButtonBox, QLabel,
+                               QVBoxLayout, QScrollArea, QWidget, QFrame)
+from PySide6.QtGui import QGuiApplication
 from .config import AI_PRESETS, THEMES, DEFAULT_THEME, FLIP_EFFECTS, DEFAULT_FLIP_EFFECT
 from .tts import TTS_VOICES, TTS_DEFAULT_VOICE, TTS_RATES
 
@@ -74,6 +76,17 @@ class SettingsDialog(QDialog):
         # 网络代理：Reader 只认这里（不读 Windows 系统代理/注册表），留空 = 直连
         self.proxy = QLineEdit(cfg.get("proxy", ""))
         self.proxy.setPlaceholderText("如 http://127.0.0.1:1081（sing-box mixed 入站）；留空 = 直连")
+        # WebDAV 进度同步
+        self.webdav_enabled = QCheckBox("启用 WebDAV 阅读进度同步")
+        self.webdav_enabled.setChecked(bool(cfg.get("webdav_enabled", False)))
+        self.webdav_url = QLineEdit(cfg.get("webdav_url", ""))
+        self.webdav_url.setPlaceholderText("如 http://127.0.0.1:8080/reader")
+        self.webdav_user = QLineEdit(cfg.get("webdav_user", ""))
+        self.webdav_user.setPlaceholderText("匿名服务器可留空（用户名和密码都空则不发认证头）")
+        self.webdav_password = QLineEdit(cfg.get("webdav_password", ""))
+        self.webdav_password.setEchoMode(QLineEdit.Password)
+        self.sync_user_name = QLineEdit(cfg.get("sync_user_name", "default"))
+        self.device_name = QLineEdit(cfg.get("device_name", ""))
         # 双语朗读（朗读时 AI 翻译）
         self.bilingual = QCheckBox("朗读时自动翻译并显示")
         self.bilingual.setChecked(bool(cfg.get("bilingual", False)))
@@ -90,7 +103,9 @@ class SettingsDialog(QDialog):
         if not matched:
             self.preset.setCurrentText("自定义")
         self.preset.currentTextChanged.connect(self._apply)
-        form = QFormLayout(self)
+        # 表单放进滚动区，按钮固定在底部：选项多于屏幕高度时仍可操作
+        content = QWidget()
+        form = QFormLayout(content)
         form.addRow("服务商预设", self.preset)
         form.addRow("API Key", self.key)
         form.addRow("API Base", self.base)
@@ -119,9 +134,27 @@ class SettingsDialog(QDialog):
         form.addRow("双语翻译", self.bilingual)
         form.addRow("翻译目标", self.bilingual_target)
         form.addRow("网络代理", self.proxy)
+        form.addRow("WebDAV 同步", self.webdav_enabled)
+        form.addRow("WebDAV 地址", self.webdav_url)
+        form.addRow("WebDAV 用户名", self.webdav_user)
+        form.addRow("WebDAV 密码", self.webdav_password)
+        form.addRow("同步用户名", self.sync_user_name)
+        form.addRow("设备名", self.device_name)
         btn = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btn.accepted.connect(self.accept); btn.rejected.connect(self.reject)
-        form.addRow(btn)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidget(content)
+        root = QVBoxLayout(self)
+        root.addWidget(scroll)
+        root.addWidget(btn)
+        # 高度不超过当前屏幕可用高度的 85%
+        want_h = content.sizeHint().height() + btn.sizeHint().height() + 24
+        want_w = content.sizeHint().width() + 40
+        scr = QGuiApplication.primaryScreen()
+        max_h = int(scr.availableGeometry().height() * 0.85) if scr else want_h
+        self.resize(want_w, min(want_h, max_h))
 
     def _apply(self, name):
         b, m = AI_PRESETS.get(name, ("", ""))
