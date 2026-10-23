@@ -280,6 +280,7 @@ class Book:
     last_opened: float = 0.0
     last_read: float = 0.0           # max(last_opened, 进度更新时间, 书签时间)
     same_as: List[str] = field(default_factory=list)   # 来源不同但文件名+大小相同的书（「可能是同一本书」）
+    unpushed: bool = False           # 本设备对这本书的 fav / hidden 修改还没推送到云端（橙点；只是显示用，不写索引）
 
     @property
     def status(self) -> str:
@@ -1003,6 +1004,9 @@ def _clean_stamp(st):
     out = {"mtime": mt, "size": sz}
     if isinstance(st.get("etag"), str):
         out["etag"] = st["etag"][:256]
+    ft = _num(st.get("fetched_at"))
+    if ft is not None:
+        out["fetched_at"] = ft                   # racy 规则要用：抓取时刻（服务器时钟域）
     return out
 
 
@@ -1040,11 +1044,28 @@ def _clean_cloud(cl) -> dict:
     return {"missing": out}
 
 
+MAX_UNPUSHED = 5000
+
+
+def _clean_ids(x) -> List[str]:
+    """state.json 的 unpushed 段：本设备改过、还没推送的 book_id（橙点用）。坏条目逐条丢弃。"""
+    if not isinstance(x, list):
+        return []
+    out, seen = [], set()
+    for b in x:
+        if isinstance(b, str) and b not in seen and valid_book_id(b):
+            seen.add(b)
+            out.append(b)
+        if len(out) >= MAX_UNPUSHED:
+            break
+    return out
+
+
 def default_state(device_id: Optional[str] = None) -> dict:
     return {"version": STATE_VERSION, "device_id": device_id or new_device_id(), "clock_skew_ms": 0,
             "confirmed_upload": False, "pushed_rev": 0, "pushed_hash": "", "remote_stamp": None,
             "ui": dict(DEFAULT_UI, collapsed=[]), "cursors": {"peers": {}, "rounds_since_full": 0},
-            "cloud": {"missing": {}}}
+            "cloud": {"missing": {}}, "unpushed": [], "reset_pending": False}
 
 
 def load_state(root: Optional[str] = None) -> dict:
@@ -1074,6 +1095,8 @@ def load_state(root: Optional[str] = None) -> dict:
     st["ui"] = _clean_ui(raw.get("ui"))
     st["cursors"] = _clean_cursors(raw.get("cursors"))
     st["cloud"] = _clean_cloud(raw.get("cloud"))
+    st["unpushed"] = _clean_ids(raw.get("unpushed"))
+    st["reset_pending"] = raw.get("reset_pending") is True
     if st["version"] > STATE_VERSION:
         st["_readonly"] = True               # 更高主版本：只读不写
     elif fresh:
@@ -1175,10 +1198,10 @@ def bookmark_snapshot(bookmarks) -> Dict[str, dict]:
     return out
 
 
-def progress_overlay(progress: Optional[dict]) -> dict:
+def progress_overlay(progress: Optional[dict], entries: Optional[dict] = None) -> dict:
     """把本机记录的进度百分比 {book_id: {percent, updated, device}} 包成 build_books 认的「覆盖层视图」。
-    不是覆盖层本身（不写 overlay.json、不上传）：阶段 4 起这一段由设备文件的 progress 摘要取代。"""
-    return {"version": WIRE_VERSION, "_view": True, "entries": {}, "progress": dict(progress or {})}
+    不是覆盖层本身（不写 overlay.json、不上传）。阶段 5 起 entries 传入合并视图里的 fav / hidden / meta 条目。"""
+    return {"version": WIRE_VERSION, "_view": True, "entries": dict(entries or {}), "progress": dict(progress or {})}
 
 
 def note_opened(b: Book, ts: float) -> None:
@@ -1383,3 +1406,186 @@ def progress_seed(bookmarks, copy_path: str) -> Optional[dict]:
             continue
         best = {"_progress_": int(off), "_progress_ts_": ts, "source": k}
     return best
+
+
+# ================================================================== 阶段 5：覆盖层同步（自愈 / 单实例锁 / 重置）
+def apply_flags(books, merged: Optional[dict]) -> int:
+    """把合并视图里的 fav / hidden 就地写到 Book 上（冷启动用 index.json 缓存画界面时、编辑后立即生效）。返回被改动的书数。"""
+    n = 0
+    for b in (books.values() if isinstance(books, dict) else books):
+        fav = bool(field_value(merged, b.id, "fav", False))
+        hid = bool(field_value(merged, b.id, "hidden", False))
+        if b.fav != fav or b.hidden != hid:
+            b.fav, b.hidden = fav, hid
+            n += 1
+    return n
+
+
+def content_key(ov: dict, device_id: Optional[str] = None) -> str:
+    """覆盖层「会被上传的内容」（entries + progress，不含 hostname 等元信息）的哈希。
+    用来比较「远端文件」与「本地」是否一致：只有 hostname 不同不算不一致（避免克隆设备互相覆盖元信息而死循环）。"""
+    w = to_wire(ov, device_id if device_id is not None else ov.get("device_id"))
+    return hashlib.sha1(_canon([w["entries"], w["progress"]]).encode("utf-8")).hexdigest()
+
+
+def has_content(ov: Optional[dict]) -> bool:
+    """本设备覆盖层里有没有任何会上传的东西（条目或进度摘要）。"""
+    return bool(ov) and bool(ov.get("entries") or ov.get("progress"))
+
+
+def reconcile_own(local: dict, remote: dict, now_ms: Optional[int] = None):
+    """自愈（design §4.3 步骤 3）：本设备自己的远端文件 remote（validate_overlay(device_id=本设备) 的结果）与本地 local 比。
+    返回 (adopted, behind)：
+      adopted  远端有、本地没有（或更新）的值并进本地之后的新覆盖层（local 的拷贝）；本地不需要变则为 None。
+               典型：device_id 被克隆，另一台机器写了同一个文件。进度摘要并入后仍按 DIGEST_KEEP 修剪（避免来回拉锯）。
+      behind   远端缺少或落后于（并入后的）本地的任何值：需要重新 PUT（服务器回滚、被误删后又被别处重建的旧内容等）。
+    不修改 local（主线程拿到结果后自己决定怎么替换）。"""
+    m = merge(local, remote, now_ms=now_ms)
+    cand = dict(local)
+    cand["entries"], cand["progress"], cand["_clock"] = m["entries"], m["progress"], m["_clock"]
+    prune_progress(cand)
+    changed = content_key(cand) != content_key(local)
+    behind = content_key(cand) != content_key(remote, local.get("device_id"))
+    return (cand if changed else None), behind
+
+
+def reset_overlay(ov: dict) -> None:
+    """「重置书架状态」：截断本设备覆盖层（保留 device_id / hostname / user）。"""
+    ov["entries"], ov["progress"], ov["_clock"] = {}, {}, []
+    ov["_rev"] = int(ov.get("_rev", 0)) + 1
+
+
+def clear_peers(root: Optional[str] = None) -> int:
+    """清空 peers/ 缓存（其它设备文件的只读拷贝）。返回删除的文件数。"""
+    n = 0
+    d = peers_dir(root)
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return 0
+    for name in names:
+        try:
+            os.remove(os.path.join(d, name))
+            n += 1
+        except OSError:
+            pass
+    return n
+
+
+class ShelfLock:
+    """~/.pyreader/shelf/.lock 的单实例锁（design §4.5）：OS 级独占锁（Windows msvcrt、其它 fcntl），进程退出时系统自动释放。
+    取不到的实例以只读模式打开书架。"""
+
+    def __init__(self, fh, path: str, kind: str):
+        self._fh, self.path, self.kind = fh, path, kind
+
+    def release(self) -> None:
+        fh, self._fh = self._fh, None
+        if fh is None:
+            return
+        try:
+            if self.kind == "msvcrt":
+                import msvcrt
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            elif self.kind == "fcntl":
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            fh.close()
+        except OSError:
+            pass
+        if self.kind == "pid":
+            try:
+                os.remove(self.path)
+            except OSError:
+                pass
+
+    @property
+    def held(self) -> bool:
+        return self._fh is not None
+
+    def __del__(self):
+        try:
+            self.release()
+        except Exception:
+            pass
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+            h = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)      # PROCESS_QUERY_LIMITED_INFORMATION
+            if not h:
+                return False
+            ctypes.windll.kernel32.CloseHandle(h)
+            return True
+        except Exception:
+            return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _pid_lock(path: str) -> Optional[ShelfLock]:
+    """回退：PID 锁文件（OS 锁不可用时，例如文件系统不支持）。文件里的进程已不存在则视为残留，接管。"""
+    for _ in range(2):
+        try:
+            fd = os.open(path + ".pid", os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                with open(path + ".pid", "r", encoding="ascii") as f:
+                    pid = int((f.read() or "0").strip() or 0)
+            except (OSError, ValueError):
+                pid = 0
+            if pid and _pid_alive(pid) and pid != os.getpid():
+                return None
+            try:
+                os.remove(path + ".pid")
+            except OSError:
+                return None
+            continue
+        except OSError:
+            return None
+        fh = os.fdopen(fd, "w", encoding="ascii")
+        fh.write(str(os.getpid()))
+        fh.flush()
+        return ShelfLock(fh, path + ".pid", "pid")
+    return None
+
+
+def acquire_lock(root: Optional[str] = None) -> Optional[ShelfLock]:
+    """取单实例锁；取不到（另一个进程 / 同进程里另一个持有者在用）返回 None。拿到后一直持有到 release() 或进程退出。"""
+    import errno
+    path = os.path.join(shelf_dir(root), ".lock")
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fh = open(path, "a+b")
+    except OSError:
+        return _pid_lock(path)
+    try:
+        if os.name == "nt":
+            import msvcrt
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            return ShelfLock(fh, path, "msvcrt")
+        import fcntl
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return ShelfLock(fh, path, "fcntl")
+    except (ImportError, AttributeError):
+        fh.close()
+        return _pid_lock(path)
+    except OSError as e:
+        fh.close()
+        if e.errno in (errno.EACCES, errno.EAGAIN, errno.EDEADLK, getattr(errno, "EWOULDBLOCK", errno.EAGAIN), 36):
+            return None                                  # 别人持有
+        return _pid_lock(path)                           # 其它错误（文件系统不支持锁等）：退回 PID 锁文件

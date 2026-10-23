@@ -10,7 +10,9 @@
   - pull_peers / load_cached_peers / digest_progress   其它设备的设备文件（进度摘要）：游标 + racy 规则 + peers/ 缓存
   - pull_progress_index                                 摘要里没有的书：小线程池逐书补缺，按文件体 book_id 校验
   - upload_book_safe                                    手动上传（.part + 完成校验 + MOVE / 退化 PUT，绝不静默覆盖）
-覆盖层的 fav / hidden、自愈、单实例锁、重置属于阶段 5，不在这里。上传永远是用户手动触发，没有任何自动上传。
+阶段 5 起：本设备自己的设备文件也在每轮里核对并自愈（check_own_file：服务器回滚 / 被误删 / device_id 被克隆），
+推送带读回校验（push_device_verified）；进度同步与推送两类任务共用一把 IO 锁，同一时间只有一个书架同步任务在碰设备文件。
+上传永远是用户手动触发，没有任何自动上传。
 """
 import json
 import os
@@ -321,17 +323,55 @@ class PeerResult:
     dropped: List[str] = field(default_factory=list)         # 列表里不再出现：权威的「已删除」，缓存已丢弃
     skipped: int = 0                                         # 名字不合法的条目数
     requests: int = 0                                        # 本轮发出的请求数（1 次 PROPFIND + 每个重新抓取的设备 1 次 GET）
+    own: Optional["OwnCheck"] = None                         # 本设备自己的设备文件的核对结果（check_own=True 才有）
+    skew_ms: Optional[int] = None                            # 服务器 Date 头相对本机时钟的偏差（毫秒，含正负；没有 Date 头为 None）
+
+
+@dataclass
+class OwnCheck:
+    """本设备自己的设备文件（users/<me>/shelf/<device_id>.json）这一轮的核对结果（design §4.3 步骤 2、3：自愈）。
+    本函数只做读取与校验，不改任何东西；是否采纳 / 重推由主线程（覆盖层的所有者）用 shelf.reconcile_own 决定。"""
+    listed: bool = False                 # PROPFIND 里列出了自己的文件
+    missing: bool = False                # 没列出（404 / 被误删），而本地有内容：需要重推
+    fetched: bool = False                # 本轮重新 GET 并校验了
+    remote: Optional[dict] = None        # GET 到的内容（validate_overlay(device_id=本设备) 的视图）
+    corrupt: bool = False                # 文件在，但内容不是合法的覆盖层：需要重推覆盖
+    failed: bool = False                 # GET 失败：什么都不下结论，下一轮再看
+    stamp: Optional[dict] = None         # 自己文件现在的戳（含 fetched_at）；没重新抓取时是传入的游标原样
+
+
+def check_own_file(client: WebDavClient, user: str, own_device: str, own_ent, own_stamp: Optional[dict],
+                   has_content: bool, fetch_time: float, force: bool = False) -> tuple:
+    """-> (OwnCheck, 请求数)。own_ent：PROPFIND 里列出的自己的文件（None = 没列出）；own_stamp：上次确认过的戳
+    （state.json 的 remote_stamp，含 fetched_at）。戳没变且游标可信（见 needs_fetch）就不 GET。"""
+    if own_ent is None:
+        return OwnCheck(listed=False, missing=bool(has_content)), 0
+    if not force and not needs_fetch(own_stamp, own_ent):
+        return OwnCheck(listed=True, stamp=own_stamp), 0
+    st = dict(stamp_of(own_ent), fetched_at=float(fetch_time))
+    try:
+        r = client.get_ex(device_file(user, own_device), JSON_MAX_BYTES)
+    except WebDavError as e:
+        _log_net(f"[书架] 读取本设备文件失败: {e}")
+        return OwnCheck(listed=True, failed=True), 1
+    raw = _parse_json(r.body)
+    clean, _issues = sh.validate_overlay(raw, device_id=own_device) if isinstance(raw, dict) else (None, ["not an object"])
+    if clean is None:
+        return OwnCheck(listed=True, fetched=True, corrupt=True, stamp=st), 1
+    return OwnCheck(listed=True, fetched=True, remote=clean, stamp=st), 1
 
 
 def pull_peers(client: WebDavClient, root: Optional[str], user: str, own_device: str, cursors: Optional[dict] = None,
-               *, now: Optional[float] = None, force_full: bool = False) -> PeerResult:
+               *, now: Optional[float] = None, force_full: bool = False, check_own: bool = False,
+               own_stamp: Optional[dict] = None, own_has_content: bool = False) -> PeerResult:
     """design §4.3 步骤 2：PROPFIND users/<me>/shelf/，对每个其它设备的文件按游标决定是否 GET。阻塞，只能在后台线程用。
 
     - 设备 id 只取自通过 safe_component 的文件名（<id>.json），不取自 JSON 内字段；本设备自己的文件不读。
     - 先原子写 peers/<id>.json，再更新游标（顺序不可反）；GET 失败保留上次好副本、游标不动。
     - PROPFIND 成功且不再列出某设备 = 权威的「已删除」：丢弃它的 peers/ 缓存与游标；目录 404 = 一个设备文件都没有。
     - PROPFIND 本身失败（离线 / 5xx）抛 WebDavError，缓存与游标原样不动（调用方负责接住）。
-    - 请求数上界：1 + 设备数。"""
+    - 请求数上界：1 + 设备数（check_own 时再加自己的文件最多 1 次 GET）。
+    - check_own：同一次 PROPFIND 里也核对本设备自己的文件（见 res.own）；自己的文件永远不进 views / peers/ 缓存。"""
     u = check_user(user)
     if u is None:
         raise WebDavError(USER_ERR)
@@ -349,8 +389,12 @@ def pull_peers(client: WebDavClient, root: Optional[str], user: str, own_device:
             raise
         entries = []                                      # 还没有任何设备文件
     res.requests += 1
+    t_back = time.time()
     fetch_time = server_now(hdr, t_list) if "date" in hdr and now is None else t_list     # 与 mtime 同一时钟域
+    if now is None and "date" in hdr:         # 可选增强（design §4.6）：服务器 Date 头 - 本机时钟；Date 只有秒级精度，调用方只在偏差够大时才采信
+        res.skew_ms = int((server_now(hdr, t_back) - (t_list + t_back) / 2.0) * 1000)
     listed = {}
+    own_ent = None
     for e in entries:
         if e.is_dir or not e.name.endswith(".json"):
             continue
@@ -360,6 +404,8 @@ def pull_peers(client: WebDavClient, root: Optional[str], user: str, own_device:
             continue
         if dev != own_device:
             listed[dev] = e
+        else:
+            own_ent = e
 
     for dev in sorted(listed):
         ent = listed[dev]
@@ -414,6 +460,9 @@ def pull_peers(client: WebDavClient, root: Optional[str], user: str, own_device:
             pass
         res.dropped.append(dev)
     res.cursors = {"peers": peers_cur, "rounds_since_full": 0 if full else rounds}
+    if check_own:
+        res.own, n = check_own_file(client, u, own_device, own_ent, own_stamp, own_has_content, fetch_time, full)
+        res.requests += n
     return res
 
 
@@ -482,14 +531,34 @@ def pull_progress_index(client: WebDavClient, user: str, bids: Iterable[str], *,
     return res
 
 
-def push_device_file(client: WebDavClient, user: str, device_id: str, payload: bytes) -> str:
-    """PUT users/<user>/shelf/<device_id>.json（只有本设备写这个文件）。返回响应里的 ETag（没有则 ""）。
+def push_device_verified(client: WebDavClient, user: str, device_id: str, payload: bytes) -> tuple:
+    """PUT users/<user>/shelf/<device_id>.json（只有本设备写这个文件），再回读比对（design §4.3 推送与自愈 2）。
+    返回 (etag, 戳)：etag 取 PUT 响应（没有则 ""）；戳 = 回读时 PROPFIND 给出的 (mtime, size, etag) + fetched_at，
+    调用方记成 remote_stamp，下一轮就能判断「服务器上的文件是不是我上次写的那份」。
+    回读内容与 payload 不一致（被截断 / 别的写者同时写）抛 WebDavError，调用方不得记录为已推送。
     阻塞，只能在后台线程用。payload 只能是 shelf.wire_bytes(overlay)（to_wire 白名单）。"""
     u = check_user(user)
     if u is None or safe_component(device_id) is None:
         raise WebDavError(USER_ERR)
     client.mkdirs(device_dir(u))
-    return client.put_ex(device_file(u, device_id), payload).headers.get("etag", "")
+    path = device_file(u, device_id)
+    etag = client.put_ex(path, payload).headers.get("etag", "")
+    hdr: dict = {}
+    t0 = time.time()
+    ents = client.propfind(device_dir(u), 1, headers_out=hdr)
+    mine = next((e for e in ents if e.name == f"{device_id}.json" and not e.is_dir), None)
+    if mine is None or (mine.size and mine.size != len(payload)):
+        raise WebDavError("推送后校验失败：服务器上的设备文件与刚写入的不符")
+    back = client.get_ex(path, JSON_MAX_BYTES).body
+    if back != payload:
+        raise WebDavError("推送后回读校验失败：服务器上的内容与刚写入的不一致（可能有别的写者），稍后重试")
+    stamp = dict(stamp_of(mine), fetched_at=float(server_now(hdr, t0)))
+    return etag, stamp
+
+
+def push_device_file(client: WebDavClient, user: str, device_id: str, payload: bytes) -> str:
+    """push_device_verified 的兼容包装：只返回 ETag。"""
+    return push_device_verified(client, user, device_id, payload)[0]
 
 
 # ================================================================== 阶段 4：手动上传（design §4.10）
@@ -647,7 +716,7 @@ class ShelfSyncWorker(QObject):
     status = Signal(str)
     progressPulled = Signal(object)      # ProgressResult：其它设备的摘要 + 逐书补缺的进度
     progressFailed = Signal(str)         # 进度同步失败（离线 / 认证 / 用户名不合法）：调用方保留本地缓存
-    pushed = Signal(int, str, str)       # (rev, 内容哈希, etag)：设备文件已推送
+    pushed = Signal(int, str, str, object)   # (rev, 内容哈希, etag, 读回校验后的戳 dict)：设备文件已推送（读回比对通过）
     pushFailed = Signal(str)
     uploadDone = Signal(object, object)  # (token, UploadResult)
 
@@ -668,6 +737,8 @@ class ShelfSyncWorker(QObject):
         self._neg: Dict[str, float] = {}                   # 逐书进度文件不存在的书 -> 上次探测时间（time.monotonic）
         self._push_job: Optional[tuple] = None
         self._push_running = False
+        self._push_thread: Optional[threading.Thread] = None
+        self._io = threading.Lock()                        # 进度同步 / 推送共用：同一时间只有一个书架同步任务在碰设备文件（单飞）
 
     # ------------------------------------------------------------ 列表（单飞：同一时间只有一个，后到者合并为「再跑一次」）
     def refresh(self, cfg: dict) -> Optional[threading.Thread]:
@@ -756,15 +827,22 @@ class ShelfSyncWorker(QObject):
         return t
 
     # ------------------------------------------------------------ 进度同步（阶段 4）：其它设备的摘要 + 逐书补缺
+    def forget_cursors(self) -> None:
+        """重置书架状态后：丢掉工作线程里记着的游标（不然会接着用重置前的游标）。"""
+        with self._lock:
+            self._prog_cursors = None
+
     def sync_progress(self, cfg: dict, root: Optional[str], device_id: str, cursors: Optional[dict],
-                      want_ids: Iterable[str], force_full: bool = False) -> Optional[threading.Thread]:
+                      want_ids: Iterable[str], force_full: bool = False,
+                      own: Optional[dict] = None) -> Optional[threading.Thread]:
         """后台拉取：users/<me>/shelf/ 里其它设备的摘要（游标 + racy 规则），再对 want_ids（摘要里仍没有进度的书）
         小线程池补缺。结果经 progressPulled；失败经 progressFailed（不抛）。单飞：已有一轮在跑则合并为「再跑一次」。
-        未启用 WebDAV 返回 None。"""
+        own：{"stamp": 上次确认过的本设备文件的戳, "has_content": 本地覆盖层有没有内容} —— 给了就同时核对本设备自己的文件
+        （自愈，见 OwnCheck）；不给（只读实例）则完全不碰自己的文件。未启用 WebDAV 返回 None。"""
         if self._factory(cfg) is None:
             return None
         with self._lock:
-            self._prog_job = (cfg, root, device_id, cursors, list(want_ids), force_full)
+            self._prog_job = (cfg, root, device_id, cursors, list(want_ids), force_full, own)
             if self._prog_running:
                 return None
             self._prog_running = True
@@ -779,7 +857,7 @@ class ShelfSyncWorker(QObject):
                 if job is None:
                     self._prog_running = False
                     return
-            cfg, root, device_id, cursors, want, force_full = job
+            cfg, root, device_id, cursors, want, force_full, own = job
             try:
                 client = self._factory(cfg)
                 if client is None:
@@ -787,12 +865,16 @@ class ShelfSyncWorker(QObject):
                 user = cfg.get("sync_user_name") or "default"
                 if self._prog_cursors is not None:
                     cursors = self._prog_cursors
-                peers = pull_peers(client, root, user, device_id, cursors, force_full=force_full)
+                with self._io:
+                    peers = pull_peers(client, root, user, device_id, cursors, force_full=force_full,
+                                       check_own=own is not None, own_stamp=(own or {}).get("stamp"),
+                                       own_has_content=bool((own or {}).get("has_content")))
                 self._prog_cursors = peers.cursors
                 digest = digest_progress(peers.views)
                 now = time.monotonic()
                 todo = [b for b in want if b not in digest and now - self._neg.get(b, -1e12) >= NEG_RETRY_SECONDS]
-                fill = pull_progress_index(client, user, todo) if todo else FillResult()
+                with self._io:
+                    fill = pull_progress_index(client, user, todo) if todo else FillResult()
                 for b in fill.absent + fill.bad:
                     self._neg[b] = now
                 for b in fill.found:
@@ -821,8 +903,17 @@ class ShelfSyncWorker(QObject):
                 return None
             self._push_running = True
         t = threading.Thread(target=self._push_loop, daemon=True)
+        self._push_thread = t
         t.start()
         return t
+
+    def join_push(self, timeout: float) -> bool:
+        """等推送线程结束（关闭窗口时的有界 flush；timeout 秒封顶）。返回是否已空闲。"""
+        t = self._push_thread
+        if t is not None and t.is_alive():
+            t.join(max(0.0, timeout))
+        with self._lock:
+            return not self._push_running
 
     def _push_loop(self):
         while True:
@@ -836,8 +927,9 @@ class ShelfSyncWorker(QObject):
                 client = self._factory(cfg)
                 if client is None:
                     raise WebDavError("WebDAV 未启用")
-                etag = push_device_file(client, cfg.get("sync_user_name") or "default", device_id, payload)
-                self.pushed.emit(rev, digest, etag)
+                with self._io:
+                    etag, stamp = push_device_verified(client, cfg.get("sync_user_name") or "default", device_id, payload)
+                self.pushed.emit(rev, digest, etag, stamp)
             except Exception as e:
                 _log_net(f"[书架] 推送设备文件失败: {e}")
                 try:
