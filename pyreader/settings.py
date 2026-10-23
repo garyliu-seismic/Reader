@@ -4,6 +4,7 @@ from PySide6.QtWidgets import (QDialog, QComboBox, QLineEdit, QCheckBox, QDouble
 from PySide6.QtGui import QGuiApplication
 from .config import AI_PRESETS, THEMES, DEFAULT_THEME, FLIP_EFFECTS, DEFAULT_FLIP_EFFECT
 from .tts import TTS_VOICES, TTS_DEFAULT_VOICE, TTS_RATES
+from .shelfview import SORT_LABELS as SHELF_SORT_LABELS
 
 # ============ 设置对话框 ============
 class SettingsDialog(QDialog):
@@ -87,6 +88,25 @@ class SettingsDialog(QDialog):
         self.webdav_password.setEchoMode(QLineEdit.Password)
         self.sync_user_name = QLineEdit(cfg.get("sync_user_name", "default"))
         self.device_name = QLineEdit(cfg.get("device_name", ""))
+        # 书架：默认视图 / 默认排序 / 启动时显示书架 / 重置
+        self.shelf_view = QComboBox()
+        self.shelf_view.addItem("网格", "grid")
+        self.shelf_view.addItem("列表", "list")
+        vi2 = self.shelf_view.findData(cfg.get("shelf_default_view", "grid"))
+        self.shelf_view.setCurrentIndex(vi2 if vi2 >= 0 else 0)
+        self.shelf_sort = QComboBox()
+        for key, label in SHELF_SORT_LABELS:
+            self.shelf_sort.addItem(label, key)
+        si2 = self.shelf_sort.findData(cfg.get("shelf_default_sort", "last_read"))
+        self.shelf_sort.setCurrentIndex(si2 if si2 >= 0 else 0)
+        self.shelf_start = QCheckBox("启动时显示书架")
+        self.shelf_start.setChecked(bool(cfg.get("shelf_start_in_shelf", False)))
+        self.shelf_start.setToolTip("不勾选时：有最近阅读的书则进入阅读页，否则显示书架")
+        self.shelf_reset = QCheckBox("点「确定」时重置书架状态")
+        self.shelf_reset.setChecked(False)
+        self.shelf_reset.setToolTip("重置书架的界面偏好与索引缓存（含本机记录的阅读百分比和打开时间），并清空本设备的收藏 / 隐藏 / 进度摘要"
+                                    "（启用云同步时，云端本设备的设备文件也会被清空；其它设备的状态不受影响）。"
+                                    "不删除书，也不动阅读书签 / 进度。")
         # 双语朗读（朗读时 AI 翻译）
         self.bilingual = QCheckBox("朗读时自动翻译并显示")
         self.bilingual.setChecked(bool(cfg.get("bilingual", False)))
@@ -140,6 +160,11 @@ class SettingsDialog(QDialog):
         form.addRow("WebDAV 密码", self.webdav_password)
         form.addRow("同步用户名", self.sync_user_name)
         form.addRow("设备名", self.device_name)
+        form.addRow("书架", QLabel("（默认视图 / 排序在改动后立即应用）"))
+        form.addRow("默认视图", self.shelf_view)
+        form.addRow("默认排序", self.shelf_sort)
+        form.addRow("启动", self.shelf_start)
+        form.addRow("重置", self.shelf_reset)
         btn = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btn.accepted.connect(self.accept); btn.rejected.connect(self.reject)
         scroll = QScrollArea()

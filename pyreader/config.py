@@ -1,14 +1,26 @@
 """PyReader 全局配置：路径、排版常量、主题、AI 预设、JSON 读写、字体选择、多媒体。"""
 import os
 import sys
-import json
 import time
+import urllib.parse
 import urllib.request
 import urllib.error
 from pathlib import Path
 
+from .store import load_json, save_json  # noqa: F401  原子读写已移到 store.py，这里保留旧入口
+
+
 # ---- 数据存储路径 ----
-APP_DIR = os.path.join(os.path.expanduser("~"), ".pyreader")
+def resolve_app_dir(env=None) -> str:
+    """数据目录：环境变量 PYREADER_HOME（测试隔离 / 便携部署）优先，否则 ~/.pyreader。
+    必须在下面定义 APP_DIR 之前求值，所以放在模块最前面。"""
+    home = ((os.environ if env is None else env).get("PYREADER_HOME") or "").strip()
+    if home:
+        return os.path.abspath(os.path.expanduser(home))
+    return os.path.join(os.path.expanduser("~"), ".pyreader")
+
+
+APP_DIR = resolve_app_dir()
 os.makedirs(APP_DIR, exist_ok=True)
 CONFIG_PATH    = os.path.join(APP_DIR, "config.json")
 BOOKMARKS_PATH = os.path.join(APP_DIR, "bookmarks.json")
@@ -42,16 +54,40 @@ def set_net_proxy(url: str):
     _proxy_down_until = 0.0         # 手改设置后重新给代理一次机会
 
 
+# 跨主机重定向时剥掉凭据：urllib 默认会把 Authorization 原样带到新主机，
+# 恶意/被劫持的服务器可借一个 302 拿到 WebDAV 密码或 API key。
+_CRED_HEADERS = {"authorization", "proxy-authorization", "api-key", "x-api-key", "cookie"}
+
+
+def _origin(url: str):
+    u = urllib.parse.urlsplit(url)
+    scheme = (u.scheme or "").lower()
+    port = u.port or {"http": 80, "https": 443}.get(scheme)
+    return scheme, (u.hostname or "").lower(), port
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and _origin(req.full_url) != _origin(new.full_url):
+            for hdrs in (new.headers, new.unredirected_hdrs):
+                for k in [k for k in hdrs if k.lower() in _CRED_HEADERS]:
+                    del hdrs[k]
+        return new
+
+
 def _opener(use_proxy: bool):
     global _proxy_opener, _direct_opener
     if use_proxy:
         if _proxy_opener is None:
             _proxy_opener = urllib.request.build_opener(
-                urllib.request.ProxyHandler({"http": NET_PROXY, "https": NET_PROXY}))
+                urllib.request.ProxyHandler({"http": NET_PROXY, "https": NET_PROXY}),
+                _SafeRedirectHandler())
         return _proxy_opener
     if _direct_opener is None:
         # 显式空的 ProxyHandler → 直连，不读注册表/环境变量代理
-        _direct_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        _direct_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                                     _SafeRedirectHandler())
     return _direct_opener
 
 
@@ -143,19 +179,6 @@ except Exception:
     _HAS_MULTIMEDIA = False
 
 
-def load_json(path, default):
-    try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return default
-
-
-def save_json(path, obj):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
-
-
 # 配色主题：bg=桌面背景，page=书页，border=书页边框，text=正文，header=页眉，pageno=页码
 THEMES = {
     "夜间（默认）": {"bg": "#1b1b1e", "page": "#fdfdfb", "border": "#d8d8d8",
@@ -223,7 +246,10 @@ DEFAULT_CONFIG = {"font_family": "", "font_size": 15,
                   # WebDAV 进度同步（默认关闭；这些键只存本机 config.json，绝不上传）
                   "webdav_enabled": False, "webdav_url": "",
                   "webdav_user": "", "webdav_password": "",
-                  "sync_user_name": "default", "device_name": _default_device_name()}
+                  "sync_user_name": "default", "device_name": _default_device_name(),
+                  # 书架（非机密的界面偏好；书架数据本身在 ~/.pyreader/shelf/，不进 config.json）
+                  "shelf_default_view": "grid", "shelf_default_sort": "last_read",
+                  "shelf_start_in_shelf": False}
 
 
 # ---- 从 .env 自动读取 AI 配置（DeepSeek 翻译 + Azure Speech 朗读）----
