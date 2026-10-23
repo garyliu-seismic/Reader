@@ -251,6 +251,39 @@ class WebDavClient:
         """max_bytes 给定时，响应体超限即抛 WebDavError（不会把超大响应读进内存）。"""
         return self.get_ex(path, max_bytes).body
 
+    def get_to_file(self, path: str, fileobj, max_bytes: Optional[int] = None, chunk: int = 65536,
+                    should_cancel=None) -> int:
+        """流式 GET：按块写入已打开的二进制文件对象，返回写入字节数（大文件不进内存）。
+        超过 max_bytes、响应体短于 Content-Length（连接被截断）或 should_cancel() 为真都抛 WebDavError。"""
+        what = f"GET {path or '/'}"
+        req = urllib.request.Request(self._url(path), method="GET", headers=self._headers())
+        try:
+            with net_urlopen(req, timeout=self.timeout) as r:
+                cl = (r.headers.get("Content-Length") or "").strip() if r.headers else ""
+                expect = int(cl) if cl.isdigit() else None
+                if max_bytes is not None and expect is not None and expect > max_bytes:
+                    raise WebDavError(f"{what}: response too large ({expect} > {max_bytes})")
+                total = 0
+                while True:
+                    if should_cancel is not None and should_cancel():
+                        raise WebDavError(f"{what}: cancelled")
+                    buf = r.read(chunk)
+                    if not buf:
+                        break
+                    total += len(buf)
+                    if max_bytes is not None and total > max_bytes:
+                        raise WebDavError(f"{what}: response too large (> {max_bytes})")
+                    fileobj.write(buf)
+                if expect is not None and total != expect:
+                    raise WebDavError(f"{what}: truncated response ({total} of {expect} bytes)")
+                return total
+        except urllib.error.HTTPError as e:
+            raise WebDavError(f"{what} -> HTTP {e.code}", status=e.code) from e
+        except WebDavError:
+            raise
+        except Exception as e:
+            raise WebDavError(f"{what} failed: {e}") from e
+
     def put_ex(self, path: str, data: bytes, headers=None, ok_codes=None) -> DavResponse:
         """headers 会合并进请求头（如 {"If-None-Match": "*"}）；ok_codes（如 (412,)）内的状态不抛。"""
         h = {"Content-Type": "application/octet-stream"}
