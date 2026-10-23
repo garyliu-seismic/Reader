@@ -434,7 +434,7 @@ def test_validate_entry_count_cap():
 
 def test_validate_never_raises_on_garbage():
     rnd = random.Random(7)
-    atoms = [None, True, 1, -1, 2.5, "s", [], {}, [1], ["a", 2], {"a": 1}, float("nan"), 10 ** 30]
+    atoms = [None, True, 1, -1, 2.5, "s", [], {}, [1], ["a", 2], {"a": 1}, float("nan"), 10 ** 30, 10 ** 400, -10 ** 400]
 
     def junk(depth=0):
         r = rnd.random()
@@ -449,6 +449,34 @@ def test_validate_never_raises_on_garbage():
         clean, _issues = validate_overlay(raw, NOW)
         assert clean is not None
         merge(raw, now_ms=NOW)                         # merge 也不能抛
+
+
+def test_validate_huge_integers_never_raise():
+    """json.loads 接受任意大的整数；float() / math.isfinite() 对 >1e308 的 int 抛 OverflowError，不得逃出校验。"""
+    big = "1" + "0" * 400
+    raw_json = ('{"version":1,"device_id":"dev-b","entries":{"remote:a/b.epub":'
+                '{"fav":[true,' + big + '],"hidden":[true,5],"meta":[{"title":"t"},' + big + ']}},'
+                '"progress":{"remote:a/b.epub":{"percent":' + big + ',"updated":5},'
+                '"remote:c/d.epub":{"percent":5,"updated":' + big + '},'
+                '"remote:e/f.epub":{"percent":-' + big + ',"updated":5},'
+                '"remote:g/h.epub":{"percent":50,"updated":6}}}')
+    raw = json.loads(raw_json)
+    clean, _ = validate_overlay(raw, NOW, device_id="dev-b")
+    assert clean is not None
+    assert list(clean["progress"]) == ["remote:g/h.epub"]            # 巨大 percent / updated 的记录被跳过，其余保留
+    assert clean["entries"]["remote:a/b.epub"]["hidden"][:2] == [True, 5]
+    m = merge(raw, now_ms=NOW)                                       # merge 也不抛
+    assert "remote:g/h.epub" in m["progress"]
+    assert validate_overlay(json.loads(raw_json.replace('"version":1', '"version":' + big)), NOW, device_id="dev-b")[0] is None
+    assert derive_status(10 ** 400) == "unread"
+    assert shelf._num(10 ** 400) is None and shelf._num(-10 ** 400) is None
+    ov = shelf.new_overlay("dev-a", "h")
+    with pytest.raises(ValueError):
+        shelf.set_progress(ov, BID_R1, 10 ** 400)
+    with pytest.raises(ValueError):
+        shelf.set_progress(ov, BID_R1, 5, updated=10 ** 400)
+    ov["progress"][BID_R1] = {"percent": 10 ** 400, "updated": 5, "device": "dev-a"}
+    assert shelf.to_wire(ov)["progress"] == {}                       # 上传白名单同样不抛
 
 
 # ================================================================== merge：具体规则

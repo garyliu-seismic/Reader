@@ -163,7 +163,7 @@ def derive_status(percent: Optional[float], has_progress: bool = False) -> str:
         return "reading" if has_progress else "unread"
     try:
         p = float(percent)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return "unread"
     if not math.isfinite(p) or p <= 0:
         return "unread"
@@ -199,7 +199,11 @@ def bookmark_for(bookmarks, path: str) -> Optional[dict]:
 def _num(x, default=None):
     if isinstance(x, bool) or not isinstance(x, (int, float)):
         return default
-    return float(x) if math.isfinite(x) else default
+    try:
+        f = float(x)                      # 巨大整数（json.loads 接受）在这里抛 OverflowError；math.isfinite(int) 同样会抛
+    except (OverflowError, ValueError):
+        return default
+    return f if math.isfinite(f) else default
 
 
 # ================================================================== 本地扫描
@@ -825,8 +829,10 @@ def set_progress(ov: dict, bid: str, percent: float, updated: Optional[float] = 
     prog = ov.setdefault("progress", {})
     if bid not in prog and len(prog) >= MAX_ENTRIES:
         raise ValueError("too many progress entries")
-    prog[bid] = {"percent": min(100.0, max(0.0, p)),
-                 "updated": float(updated if updated is not None else time.time()), "device": dev}
+    upd = _num(updated if updated is not None else time.time())
+    if upd is None:
+        raise ValueError("bad updated")
+    prog[bid] = {"percent": min(100.0, max(0.0, p)), "updated": upd, "device": dev}
     ov["_rev"] = int(ov.get("_rev", 0)) + 1
 
 
