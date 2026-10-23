@@ -1,5 +1,7 @@
 from PySide6.QtWidgets import (QDialog, QComboBox, QLineEdit, QCheckBox, QDoubleSpinBox,
-                               QSpinBox, QFormLayout, QDialogButtonBox, QLabel)
+                               QSpinBox, QFormLayout, QDialogButtonBox, QLabel,
+                               QVBoxLayout, QScrollArea, QWidget, QFrame)
+from PySide6.QtGui import QGuiApplication
 from .config import AI_PRESETS, THEMES, DEFAULT_THEME, FLIP_EFFECTS, DEFAULT_FLIP_EFFECT
 from .tts import TTS_VOICES, TTS_DEFAULT_VOICE, TTS_RATES
 
@@ -101,7 +103,9 @@ class SettingsDialog(QDialog):
         if not matched:
             self.preset.setCurrentText("自定义")
         self.preset.currentTextChanged.connect(self._apply)
-        form = QFormLayout(self)
+        # 表单放进滚动区，按钮固定在底部：选项多于屏幕高度时仍可操作
+        content = QWidget()
+        form = QFormLayout(content)
         form.addRow("服务商预设", self.preset)
         form.addRow("API Key", self.key)
         form.addRow("API Base", self.base)
@@ -138,7 +142,19 @@ class SettingsDialog(QDialog):
         form.addRow("设备名", self.device_name)
         btn = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btn.accepted.connect(self.accept); btn.rejected.connect(self.reject)
-        form.addRow(btn)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidget(content)
+        root = QVBoxLayout(self)
+        root.addWidget(scroll)
+        root.addWidget(btn)
+        # 高度不超过当前屏幕可用高度的 85%
+        want_h = content.sizeHint().height() + btn.sizeHint().height() + 24
+        want_w = content.sizeHint().width() + 40
+        scr = QGuiApplication.primaryScreen()
+        max_h = int(scr.availableGeometry().height() * 0.85) if scr else want_h
+        self.resize(want_w, min(want_h, max_h))
 
     def _apply(self, name):
         b, m = AI_PRESETS.get(name, ("", ""))
