@@ -10,6 +10,13 @@
   raw_propfind    {path: bytes} 直接返回这段原始 multistatus 内容（恶意 XML）
   links           {link_path: target_path} 目录符号链接（可造出环）
   redirects       {path: absolute_url} GET 该路径时返回 302
+  ignore_inm      True：PUT 忽略 If-None-Match（模拟不支持条件请求的服务器）
+  move_status     非 None：MOVE 一律返回这个状态码（如 405 / 501：模拟不支持 MOVE）
+  no_etag         True：PROPFIND / 响应都不带 getetag（模拟不给 etag 的服务器）
+  put_hooks       [f(path, data)]：每次 PUT 落盘之前依次调用（造「PUT 期间发生别的事」的竞态）；返回 bytes 则替换落盘内容（造截断）
+  move_hooks      [f(src, dest)]：每次 MOVE 处理之前依次调用
+  req_headers     [(method, path, {If-None-Match, Overwrite, Destination})] 请求头记录
+MOVE 支持 Destination / Overwrite: F（目标已存在回 412）。
 """
 import base64
 import email.utils
@@ -17,7 +24,7 @@ import http.server
 import itertools
 import threading
 import time
-from urllib.parse import unquote, quote
+from urllib.parse import unquote, quote, urlparse
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -34,6 +41,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
     raw_propfind = None
     links = None
     redirects = None
+    ignore_inm = False
+    move_status = None
+    no_etag = False
+    put_hooks = None
+    move_hooks = None
+    req_headers = None
     counter = None
     now = staticmethod(time.time)
 
@@ -43,6 +56,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _ok(self):
         type(self).seen_auth.append(self.headers.get("Authorization"))
         type(self).log.append((self.command, self._path()))
+        type(self).req_headers.append((self.command, self._path(), {
+            k: self.headers.get(k) for k in ("If-None-Match", "Overwrite", "Destination") if self.headers.get(k)}))
         if self.auth:
             want = "Basic " + base64.b64encode(self.auth.encode()).decode()
             if self.headers.get("Authorization") != want:
@@ -79,7 +94,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _match_inm(self, p):
         """If-None-Match：'*' 匹配任何已存在资源；否则与当前 etag 比较。"""
         inm = (self.headers.get("If-None-Match") or "").strip()
-        if not inm or p not in self.files:
+        if not inm or p not in self.files or (self.command == "PUT" and self.ignore_inm):
             return False
         return inm == "*" or self.etags.get(p) in [x.strip() for x in inm.split(",")]
 
@@ -92,7 +107,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if p in self.files:
             if self._match_inm(p):
                 return self._send(304, b"", {"ETag": self.etags[p]})
-            self._send(200, self.files[p], {"ETag": self.etags[p]})
+            self._send(200, self.files[p], {} if self.no_etag else {"ETag": self.etags[p]})
         else:
             self._send(404)
 
@@ -106,10 +121,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send(409)
         if self._match_inm(p):
             return self._send(412)
+        for hook in list(self.put_hooks):
+            data = hook(p, data) or data
         self.files[p] = data
         self.mtimes[p] = int(type(self).now())
         self.etags[p] = '"%x-%d"' % (next(self.counter), len(data))
-        self._send(201, b"", {"ETag": self.etags[p]})
+        self._send(201, b"", {} if self.no_etag else {"ETag": self.etags[p]})
+
+    def do_MOVE(self):
+        self._body()
+        if not self._ok():
+            return
+        src = self._path()
+        dest = unquote(urlparse(self.headers.get("Destination") or "").path).rstrip("/")
+        for hook in list(self.move_hooks):
+            hook(src, dest)
+        if self.move_status:
+            return self._send(self.move_status)
+        if src not in self.files:
+            return self._send(404)
+        parent = dest.rsplit("/", 1)[0] or "/"
+        if parent != "/" and parent not in self.dirs:
+            return self._send(409)
+        if dest in self.files and (self.headers.get("Overwrite") or "T").upper() == "F":
+            return self._send(412)
+        existed = dest in self.files
+        self.files[dest] = self.files.pop(src)
+        self.mtimes[dest] = self.mtimes.pop(src, int(type(self).now()))
+        self.etags[dest] = self.etags.pop(src, "")
+        self._send(204 if existed else 201)
 
     def do_MKCOL(self):
         self._body()
@@ -130,10 +170,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             props = "<d:resourcetype><d:collection/></d:resourcetype>"
         else:
             props = ("<d:resourcetype/><d:getcontentlength>%d</d:getcontentlength>"
-                     "<d:getlastmodified>%s</d:getlastmodified><d:getetag>%s</d:getetag>"
+                     "<d:getlastmodified>%s</d:getlastmodified>%s"
                      % (len(self.files[real]),
                         email.utils.formatdate(self.mtimes.get(real, int(type(self).now())), usegmt=True),
-                        self.etags.get(real, "")))
+                        "" if self.no_etag else "<d:getetag>%s</d:getetag>" % self.etags.get(real, "")))
         return self._raw_entry(href, props)
 
     @staticmethod
@@ -179,7 +219,7 @@ def start(auth=None):
     h = type("H", (Handler,), {
         "files": {}, "dirs": set(), "auth": auth, "seen_auth": [], "mtimes": {}, "etags": {},
         "log": [], "fail_propfind": set(), "extra_entries": {}, "raw_propfind": {}, "links": {},
-        "redirects": {}, "counter": itertools.count(1), "now": staticmethod(time.time)})
+        "redirects": {}, "put_hooks": [], "move_hooks": [], "req_headers": [], "counter": itertools.count(1), "now": staticmethod(time.time)})
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), h)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv, h, "http://127.0.0.1:%d/dav" % srv.server_address[1]

@@ -6,19 +6,29 @@
   - ShelfSyncWorker                          后台线程 + Signal：单飞的列表刷新、带 token 的下载
 
 线程规则：所有网络都在后台线程；结果只经 Signal 回主线程；任何网络失败都不会抛进 UI（只发 Signal / 记日志）。
-本阶段不碰覆盖层和设备文件（阶段 4 / 5），也不做任何上传。
+阶段 4 起新增三块（同样前两层是纯逻辑）：
+  - pull_peers / load_cached_peers / digest_progress   其它设备的设备文件（进度摘要）：游标 + racy 规则 + peers/ 缓存
+  - pull_progress_index                                 摘要里没有的书：小线程池逐书补缺，按文件体 book_id 校验
+  - upload_book_safe                                    手动上传（.part + 完成校验 + MOVE / 退化 PUT，绝不静默覆盖）
+覆盖层的 fav / hidden、自愈、单实例锁、重置属于阶段 5，不在这里。上传永远是用户手动触发，没有任何自动上传。
 """
+import json
+import os
 import threading
 import time
+import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Set
 
 from PySide6.QtCore import QObject, Signal
 
 from . import shelf as sh
+from . import sync as syncmod
 from .config import _log_net
+from .store import is_hidden_name, load_json, safe_component, safe_segment, save_json
 from .sync import MAX_BOOK_BYTES, download_book
-from .webdav import MAX_FILES, WebDavClient, WebDavError, client_from_cfg
+from .webdav import JSON_MAX_BYTES, MAX_FILES, WebDavClient, WebDavError, client_from_cfg
 
 LIBRARY = "library"
 STABLE_SECONDS = 60          # mtime 距今不足这个秒数的文件视为「还在上传」
@@ -190,6 +200,442 @@ def extra_candidates(books: Iterable[sh.Book]) -> Dict[str, sh.RemoteFile]:
     return out
 
 
+# ================================================================== 阶段 4：设备文件（进度摘要）
+RACY_SECONDS = 2.0           # 文件 mtime 距「抓取时刻」不足这么久：同一秒内的第二次写入可能不改 mtime / size / etag，游标不可信
+FULL_EVERY = 10              # 每这么多轮强制全量 GET 一次（兜底：服务器戳不可靠时，错过的更新最迟这时也会补上）
+FILL_PER_ROUND = 50          # 摘要里没有的书，每轮最多补这么多本的逐书进度
+FILL_THREADS = 5             # 补缺的并发数（4–6）
+NEG_RETRY_SECONDS = 1800.0   # 逐书进度文件不存在（404 / 内容不符）的书，这么久之内不再探测
+USER_ERR = "同步用户名不合法（只允许字母、数字、点、下划线、连字符）"
+
+
+def device_dir(user: str) -> str:
+    return f"users/{user}/shelf"
+
+
+def device_file(user: str, device_id: str) -> str:
+    return f"{device_dir(user)}/{device_id}.json"
+
+
+def check_user(user) -> Optional[str]:
+    """sync_user_name 拼进 users/<name>/ 之前必须过 safe_component（空 = default）。不合法返回 None。"""
+    return safe_component(user or "default")
+
+
+def server_now(headers: Optional[dict], fallback: Optional[float] = None) -> float:
+    """服务器时间：取响应 Date 头（和 mtime 同一个时钟域，本机时钟偏差不会让 racy 判断失效）；没有则用本机时间。"""
+    try:
+        import email.utils
+        d = (headers or {}).get("date")
+        if d:
+            return float(email.utils.parsedate_to_datetime(d).timestamp())
+    except Exception:
+        pass
+    return time.time() if fallback is None else fallback
+
+
+def stamp_of(ent) -> dict:
+    return {"mtime": float(getattr(ent, "mtime", 0) or 0.0), "size": int(getattr(ent, "size", 0) or 0),
+            "etag": str(getattr(ent, "etag", "") or "")}
+
+
+def needs_fetch(cur: Optional[dict], ent) -> bool:
+    """游标 (mtime, size, etag, fetched_at) 与服务器现在给的戳比：要不要重新 GET。
+
+    必须重新 GET：没有游标；服务器什么戳都不给（没有 mtime 也没有 etag）；etag / mtime / size 任一不同；
+    游标是 racy 的（上次抓取时刻 - 文件 mtime < RACY_SECONDS：当时同一秒内可能还有后续写入，戳不会变）。"""
+    if not isinstance(cur, dict):
+        return True
+    st = stamp_of(ent)
+    if not st["mtime"] and not st["etag"]:
+        return True
+    if (st["etag"] or cur.get("etag")) and (cur.get("etag") or "") != st["etag"]:
+        return True
+    if float(cur.get("mtime", 0) or 0) != st["mtime"] or int(cur.get("size", -1)) != st["size"]:
+        return True
+    fetched = cur.get("fetched_at")
+    if not isinstance(fetched, (int, float)) or fetched - float(cur.get("mtime", 0) or 0) < RACY_SECONDS:
+        return True
+    return False
+
+
+def peer_cache_path(root: Optional[str], dev: str) -> str:
+    return os.path.join(sh.peers_dir(root), dev + ".json")
+
+
+def _parse_json(body: bytes):
+    try:
+        return json.loads(body.decode("utf-8-sig"))
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        return None
+
+
+def load_peer_view(root: Optional[str], dev: str) -> Optional[dict]:
+    """读 peers/<dev>.json 并校验成视图；缺失 / 损坏（被隔离为 .bad-<ts>）/ 校验不过都返回 None。"""
+    if safe_component(dev) is None:
+        return None
+    raw = load_json(peer_cache_path(root, dev), None, dict)
+    if raw is None:
+        return None
+    clean, _ = sh.validate_overlay(raw, device_id=dev)
+    return clean
+
+
+def load_cached_peers(root: Optional[str] = None) -> Dict[str, dict]:
+    """冷启动 / 离线：把 peers/ 里缓存的其它设备文件读成 {device_id: 视图}。设备 id 只取自通过校验的文件名。"""
+    out: Dict[str, dict] = {}
+    try:
+        names = sorted(os.listdir(sh.peers_dir(root)))
+    except OSError:
+        return out
+    for n in names:
+        if n.endswith(".json") and safe_component(n[:-5]):
+            v = load_peer_view(root, n[:-5])
+            if v is not None:
+                out[n[:-5]] = v
+    return out
+
+
+def digest_progress(views: Dict[str, dict]) -> Dict[str, dict]:
+    """各设备摘要合并成 {book_id: {percent, updated, device}}：updated 大者胜，平局设备 id 大者胜。
+    device 显示用该设备文件里的 hostname（没有则用 device_id）。"""
+    best: Dict[str, tuple] = {}
+    for dev in sorted(views):
+        v = views[dev] or {}
+        label = sh._clean_str(v.get("hostname"), 64) or dev
+        for bid, rec in (v.get("progress") or {}).items():
+            key = (rec["updated"], dev)
+            if bid not in best or key > best[bid][0]:
+                best[bid] = (key, {"percent": rec["percent"], "updated": rec["updated"], "device": label})
+    return {bid: v[1] for bid, v in best.items()}
+
+
+@dataclass
+class PeerResult:
+    views: Dict[str, dict] = field(default_factory=dict)     # {device_id: 校验后的视图}（含本轮没重新 GET、取自缓存的）
+    cursors: dict = field(default_factory=lambda: {"peers": {}, "rounds_since_full": 0})
+    fetched: List[str] = field(default_factory=list)         # 本轮重新 GET 的设备
+    unchanged: List[str] = field(default_factory=list)       # 游标可信、直接用缓存的设备
+    failed: List[str] = field(default_factory=list)          # GET / 写缓存失败：保留上次好副本，游标不动
+    corrupt: List[str] = field(default_factory=list)         # 内容坏了（不是 JSON / 校验不过）：跳过，游标前进（不反复 GET）
+    dropped: List[str] = field(default_factory=list)         # 列表里不再出现：权威的「已删除」，缓存已丢弃
+    skipped: int = 0                                         # 名字不合法的条目数
+    requests: int = 0                                        # 本轮发出的请求数（1 次 PROPFIND + 每个重新抓取的设备 1 次 GET）
+
+
+def pull_peers(client: WebDavClient, root: Optional[str], user: str, own_device: str, cursors: Optional[dict] = None,
+               *, now: Optional[float] = None, force_full: bool = False) -> PeerResult:
+    """design §4.3 步骤 2：PROPFIND users/<me>/shelf/，对每个其它设备的文件按游标决定是否 GET。阻塞，只能在后台线程用。
+
+    - 设备 id 只取自通过 safe_component 的文件名（<id>.json），不取自 JSON 内字段；本设备自己的文件不读。
+    - 先原子写 peers/<id>.json，再更新游标（顺序不可反）；GET 失败保留上次好副本、游标不动。
+    - PROPFIND 成功且不再列出某设备 = 权威的「已删除」：丢弃它的 peers/ 缓存与游标；目录 404 = 一个设备文件都没有。
+    - PROPFIND 本身失败（离线 / 5xx）抛 WebDavError，缓存与游标原样不动（调用方负责接住）。
+    - 请求数上界：1 + 设备数。"""
+    u = check_user(user)
+    if u is None:
+        raise WebDavError(USER_ERR)
+    cursors = cursors if isinstance(cursors, dict) else {}
+    peers_cur = {k: dict(v) for k, v in (cursors.get("peers") or {}).items() if safe_component(k) and isinstance(v, dict)}
+    rounds = int(cursors.get("rounds_since_full", 0) or 0) + 1
+    full = bool(force_full) or rounds >= FULL_EVERY
+    res = PeerResult()
+    hdr: dict = {}
+    t_list = time.time() if now is None else now
+    try:
+        entries = client.propfind(device_dir(u), 1, headers_out=hdr)
+    except WebDavError as e:
+        if e.status != 404:
+            raise
+        entries = []                                      # 还没有任何设备文件
+    res.requests += 1
+    fetch_time = server_now(hdr, t_list) if "date" in hdr and now is None else t_list     # 与 mtime 同一时钟域
+    listed = {}
+    for e in entries:
+        if e.is_dir or not e.name.endswith(".json"):
+            continue
+        dev = safe_component(e.name[:-5])
+        if dev is None:
+            res.skipped += 1
+            continue
+        if dev != own_device:
+            listed[dev] = e
+
+    for dev in sorted(listed):
+        ent = listed[dev]
+        if not full and not needs_fetch(peers_cur.get(dev), ent):
+            view = load_peer_view(root, dev)             # 游标可信：用缓存（缓存丢了就当没有游标）
+            if view is not None:
+                res.unchanged.append(dev)
+                res.views[dev] = view
+                continue
+        try:
+            r = client.get_ex(device_file(u, dev), JSON_MAX_BYTES)
+        except WebDavError as e:
+            res.requests += 1
+            _log_net(f"[书架] 读取设备文件失败 {dev}: {e}")
+            res.failed.append(dev)
+            old = load_peer_view(root, dev)
+            if old is not None:
+                res.views[dev] = old                      # 保留上次好副本
+            continue
+        res.requests += 1
+        raw = _parse_json(r.body)
+        clean, _issues = sh.validate_overlay(raw, device_id=dev) if isinstance(raw, dict) else (None, ["not an object"])
+        new_cur = dict(stamp_of(ent), fetched_at=float(fetch_time))
+        if clean is None:
+            _log_net(f"[书架] 设备文件 {dev}.json 内容无效，已跳过")
+            res.corrupt.append(dev)
+            peers_cur[dev] = new_cur                      # 同一份坏内容不重复抓取；文件一变戳就变，会再试
+            old = load_peer_view(root, dev)
+            if old is not None:
+                res.views[dev] = old
+            continue
+        try:
+            save_json(peer_cache_path(root, dev), raw)   # 先写缓存……
+        except OSError as e:
+            _log_net(f"[书架] 写入 peers 缓存失败 {dev}: {e}")
+            res.failed.append(dev)
+            continue
+        peers_cur[dev] = new_cur                          # ……再更新游标
+        res.fetched.append(dev)
+        res.views[dev] = clean
+
+    # 不再列出 = 权威的已删除
+    try:
+        cached = {n[:-5] for n in os.listdir(sh.peers_dir(root)) if n.endswith(".json") and safe_component(n[:-5])}
+    except OSError:
+        cached = set()
+    for dev in sorted((cached | set(peers_cur)) - set(listed)):
+        peers_cur.pop(dev, None)
+        try:
+            os.remove(peer_cache_path(root, dev))
+        except OSError:
+            pass
+        res.dropped.append(dev)
+    res.cursors = {"peers": peers_cur, "rounds_since_full": 0 if full else rounds}
+    return res
+
+
+# ================================================================== 阶段 4：摘要里没有的书，逐书补缺
+def parse_progress_body(body: bytes, bid: str, now: Optional[float] = None) -> Optional[dict]:
+    """逐书进度文件体 → {percent, updated, device}。文件体里的 book_id 必须等于期望的 id（永远不按文件名认书）；
+    percent / updated 必须是有限数；updated 超过「现在 + 24 小时」视为坏记录。不合格返回 None。"""
+    d = _parse_json(body)
+    if not isinstance(d, dict) or d.get("book_id") != bid:
+        return None
+    pct, upd = sh._num(d.get("percent")), sh._num(d.get("updated"))
+    now = time.time() if now is None else now
+    if pct is None or upd is None or pct < 0 or upd <= 0 or upd > now + sh.FUTURE_LIMIT_MS / 1000.0:
+        return None
+    return {"percent": min(100.0, pct), "updated": upd, "device": sh._clean_str(d.get("device"), 64) or ""}
+
+
+@dataclass
+class FillResult:
+    found: Dict[str, dict] = field(default_factory=dict)     # {book_id: {percent, updated, device}}，键是期望的 id（已核对文件体）
+    absent: List[str] = field(default_factory=list)          # 服务器上没有这本书的进度文件（404）
+    bad: List[str] = field(default_factory=list)             # 有文件但内容不合格（book_id 不符 / 不是 JSON / 数值非法）：忽略
+    failed: List[str] = field(default_factory=list)          # 网络 / 服务器错误：下次再试
+    requests: int = 0
+
+
+def pull_progress_index(client: WebDavClient, user: str, bids: Iterable[str], *, limit: int = FILL_PER_ROUND,
+                        threads: int = FILL_THREADS, now: Optional[float] = None) -> FillResult:
+    """对不在任何设备摘要里的书（例如书架功能上线前读过的），用 sync.progress_path(user, id) 算路径，
+    小线程池并发 GET（每本 1 次请求，404 不再补一次 exists），最多 limit 本。结果按文件体 book_id 校验，
+    键是期望的 id，永远不是文件名。阻塞，只能在后台线程用。连续两批全部失败（离线）就提前放弃。"""
+    u = check_user(user)
+    if u is None:
+        raise WebDavError(USER_ERR)
+    n = max(1, int(threads))
+    ids = [b for b in dict.fromkeys(bids) if sh.valid_book_id(b)][:max(0, int(limit))]
+    res = FillResult()
+
+    def one(bid):
+        try:
+            r = client.get_ex(syncmod.progress_path(u, bid), JSON_MAX_BYTES, ok_codes=(404,))
+        except Exception:
+            return bid, "failed", None
+        if r.status == 404:
+            return bid, "absent", None
+        rec = parse_progress_body(r.body, bid, now)
+        return (bid, "found", rec) if rec else (bid, "bad", None)
+
+    failed_batches = 0
+    with ThreadPoolExecutor(max_workers=n) as ex:
+        for i in range(0, len(ids), n):
+            out = list(ex.map(one, ids[i:i + n]))
+            res.requests += len(out)
+            for bid, kind, rec in out:
+                if kind == "found":
+                    res.found[bid] = rec
+                elif kind == "absent":
+                    res.absent.append(bid)
+                elif kind == "bad":
+                    res.bad.append(bid)
+                else:
+                    res.failed.append(bid)
+            failed_batches = failed_batches + 1 if all(k == "failed" for _b, k, _r in out) else 0
+            if failed_batches >= 2:
+                break
+    return res
+
+
+def push_device_file(client: WebDavClient, user: str, device_id: str, payload: bytes) -> str:
+    """PUT users/<user>/shelf/<device_id>.json（只有本设备写这个文件）。返回响应里的 ETag（没有则 ""）。
+    阻塞，只能在后台线程用。payload 只能是 shelf.wire_bytes(overlay)（to_wire 白名单）。"""
+    u = check_user(user)
+    if u is None or safe_component(device_id) is None:
+        raise WebDavError(USER_ERR)
+    client.mkdirs(device_dir(u))
+    return client.put_ex(device_file(u, device_id), payload).headers.get("etag", "")
+
+
+# ================================================================== 阶段 4：手动上传（design §4.10）
+STALE_PART_SECONDS = 900.0   # 别人的 .part 超过这么久没动（或是空文件）视为残留，可以覆盖
+MOVE_UNSUPPORTED = (400, 403, 405, 415, 501)
+
+
+@dataclass
+class UploadResult:
+    status: str                  # ok 成功 | exists 云端已有同名文件（未上传、未覆盖，请改名） | busy 别人正在上传同名文件 | error 失败
+    rel: str = ""                # 目标 library 相对路径
+    message: str = ""
+    method: str = ""             # ok 时：move（.part 改名）| put（服务器不支持 MOVE，退化为直接 PUT）
+
+
+def normalize_folder(folder) -> Optional[str]:
+    """上传目标文件夹：'' = library 根（未分类）；否则 / 分隔、每段过 safe_segment 且不以 . 或 ~$ 开头，最多 8 层。
+    返回规范化后的字符串，不合法返回 None。"""
+    if folder is None:
+        return ""
+    if not isinstance(folder, str):
+        return None
+    f = folder.strip().strip("/")
+    if not f:
+        return ""
+    segs = f.split("/")
+    if len(segs) > 8 or any(safe_segment(x) is None or is_hidden_name(x) or x != x.strip() for x in segs):
+        return None
+    return "/".join(segs)
+
+
+def upload_rel(folder, name) -> Optional[str]:
+    """合法的上传目标 library 相对路径；名字 / 文件夹不合法、扩展名不是电子书、.part 名会超长都返回 None。"""
+    f = normalize_folder(folder)
+    if f is None or not isinstance(name, str) or len(name) > 240 or name != name.strip() or safe_segment(name) is None:
+        return None                                       # name 必须是单段名字：不能带 / \ : 等
+    rel = f + "/" + name if f else name
+    return rel if sh.valid_remote_rel(rel) else None
+
+
+def _nkey(s: str) -> str:
+    return unicodedata.normalize("NFC", s).casefold()
+
+
+def _clash(ents: dict, name: str) -> bool:
+    return any(_nkey(n) == _nkey(name) for n, e in ents.items() if not e.is_dir)
+
+
+def _clear_part(client: WebDavClient, part: str) -> None:
+    """尽力把残留的 .part 清空（不向用户暴露 DELETE）：空的 .part 下次上传时视为残留，可以直接覆盖。"""
+    try:
+        client.put(part, b"")
+    except Exception:
+        pass
+
+
+def upload_book_safe(client: WebDavClient, path: str, folder, name: str, *, max_bytes: int = MAX_BOOK_BYTES,
+                     now: Optional[float] = None) -> UploadResult:
+    """把本机文件 path 手动上传为 library/<folder>/<name>。阻塞，只能在后台线程用；永远不会静默覆盖已有文件。
+
+    1. 目标（NFC + 忽略大小写比较）已存在 -> exists（不上传，调用方提示用户改名）。
+    2. 流式 PUT 到 library/<folder>/.<name>.part（点开头：其它设备的列表忽略它）。.part 已存在且不是残留 -> busy；
+       不存在时带 If-None-Match: *（服务器支持则两个上传者不会互相覆盖）。
+    3. 校验 .part 的大小等于本机文件大小；再查一次目标是否出现了。
+    4. MOVE（Overwrite: F）改成最终名；目标已存在（412）-> exists。服务器不支持 MOVE 时退化为：直接 PUT 目标
+       （带 If-None-Match: *，不支持则只能事后校验），再把 .part 清空（不暴露 DELETE）。
+    5. 事后核对最终文件大小。
+    所有网络 / 服务器错误都以 UploadResult(error) 返回，不外抛。"""
+    now = time.time() if now is None else now
+    rel = upload_rel(folder, name)
+    if rel is None:
+        return UploadResult("error", "", "名字或文件夹不合法（只允许电子书扩展名，不能含 / \\ : 等字符，不能以 . 开头）")
+    f = normalize_folder(folder)
+    try:
+        size = os.path.getsize(path)
+    except OSError as e:
+        return UploadResult("error", rel, f"读不了本机文件：{e}")
+    if size <= 0:
+        return UploadResult("error", rel, "文件是空的")
+    if size > max_bytes:
+        return UploadResult("error", rel, f"文件超过上传上限（{max_bytes // (1024 * 1024)} MB）")
+    ldir = "library/" + f if f else "library"
+    part_name = "." + name + ".part"
+    exists = UploadResult("exists", rel, f"云端已有同名文件：{rel}")
+    busy = UploadResult("busy", rel, f"另一台设备正在上传同名文件：{rel}（稍后再试）")
+    try:
+        client.mkdirs(ldir)
+        ents = {e.name: e for e in client.propfind(ldir, 1)}
+        if _clash(ents, name):
+            return exists
+        part = ldir + "/" + part_name
+        hdrs = {}
+        old = ents.get(part_name)
+        if old is None:
+            hdrs["If-None-Match"] = "*"
+        elif not (old.size == 0 or (old.mtime and now - old.mtime > STALE_PART_SECONDS)):
+            return busy
+        with open(path, "rb") as fh:
+            r = client.put_file(part, fh, size, hdrs, ok_codes=(412,))
+        if r.status == 412:
+            return busy
+        ents = {e.name: e for e in client.propfind(ldir, 1)}
+        pe = ents.get(part_name)
+        if pe is None or pe.size != size:
+            return UploadResult("error", rel, "上传不完整（服务器上的大小与本机文件不符），请重试")
+        if _clash(ents, name):
+            _clear_part(client, part)
+            return exists
+        target = ldir + "/" + name
+        method = "move"
+        try:
+            mr = client.move(part, target, overwrite=False, ok_codes=(412,))
+            if mr.status == 412:
+                _clear_part(client, part)
+                return exists
+        except WebDavError as e:
+            if e.status not in MOVE_UNSUPPORTED:
+                raise
+            method = "put"                                # 服务器不支持 MOVE：退化为直接 PUT 目标
+            with open(path, "rb") as fh:
+                r = client.put_file(target, fh, size, {"If-None-Match": "*"}, ok_codes=(412,))
+            _clear_part(client, part)
+            if r.status == 412:
+                return exists
+        got = {e.name: e for e in client.propfind(ldir, 1)}.get(name)
+        if got is None or got.is_dir or got.size != size:
+            return UploadResult("error", rel, "上传后校验失败（云端文件的大小与本机不符），请重试")
+        return UploadResult("ok", rel, f"已上传：{rel}", method)
+    except WebDavError as e:
+        _log_net(f"[书架] 上传失败 {rel}: {e}")
+        return UploadResult("error", rel, f"上传失败：{str(e)[:120]}")
+    except OSError as e:
+        return UploadResult("error", rel, f"上传失败：{e}")
+
+
+@dataclass
+class ProgressResult:
+    """一轮进度同步的结果（后台线程 -> 主线程）。"""
+    peers: PeerResult = field(default_factory=PeerResult)
+    digest: Dict[str, dict] = field(default_factory=dict)    # 各设备摘要合并后的进度 {book_id: {percent, updated, device}}
+    found: Dict[str, dict] = field(default_factory=dict)     # 逐书补缺得到的进度
+    probed: int = 0                                          # 本轮探测了多少本
+    cursors: dict = field(default_factory=dict)              # 新游标（主线程写进 state.json）
+    requests: int = 0
+
+
 # ================================================================== 后台线程
 class ShelfSyncWorker(QObject):
     """书架的云端后台任务。refresh / download 都立刻返回（线程句柄仅供测试 join），结果经 Signal 回主线程。
@@ -199,6 +645,11 @@ class ShelfSyncWorker(QObject):
     downloadedFor = Signal(object, str)  # (token, 本地路径)：与永久接到 load_book 的 SyncWorker.downloaded 无关
     downloadFailed = Signal(object, str)  # (token, 提示)
     status = Signal(str)
+    progressPulled = Signal(object)      # ProgressResult：其它设备的摘要 + 逐书补缺的进度
+    progressFailed = Signal(str)         # 进度同步失败（离线 / 认证 / 用户名不合法）：调用方保留本地缓存
+    pushed = Signal(int, str, str)       # (rev, 内容哈希, etag)：设备文件已推送
+    pushFailed = Signal(str)
+    uploadDone = Signal(object, object)  # (token, UploadResult)
 
     def __init__(self, parent=None, client_factory: Callable[[dict], Optional[WebDavClient]] = client_from_cfg):
         super().__init__(parent)
@@ -210,6 +661,13 @@ class ShelfSyncWorker(QObject):
         self._prev_sizes: Dict[str, int] = {}
         self._downloads: Dict[str, List[object]] = {}      # rel -> 等这次下载的 token 们（同一文件只下载一次）
         self.generation = 0                                # 每完成一轮列表 +1（测试用）
+        self.progress_generation = 0                       # 每完成一轮进度同步 +1（测试用）
+        self._prog_job: Optional[tuple] = None
+        self._prog_running = False
+        self._prog_cursors: Optional[dict] = None          # 上一轮产出的游标：后到者合并成「再跑一次」时接着用，不回退
+        self._neg: Dict[str, float] = {}                   # 逐书进度文件不存在的书 -> 上次探测时间（time.monotonic）
+        self._push_job: Optional[tuple] = None
+        self._push_running = False
 
     # ------------------------------------------------------------ 列表（单飞：同一时间只有一个，后到者合并为「再跑一次」）
     def refresh(self, cfg: dict) -> Optional[threading.Thread]:
@@ -291,6 +749,123 @@ class ShelfSyncWorker(QObject):
                     pass
             try:
                 self.status.emit(err or (f"已下载，正在打开：{name}" if open_when_done else f"已下载：{name}"))
+            except Exception:
+                pass
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        return t
+
+    # ------------------------------------------------------------ 进度同步（阶段 4）：其它设备的摘要 + 逐书补缺
+    def sync_progress(self, cfg: dict, root: Optional[str], device_id: str, cursors: Optional[dict],
+                      want_ids: Iterable[str], force_full: bool = False) -> Optional[threading.Thread]:
+        """后台拉取：users/<me>/shelf/ 里其它设备的摘要（游标 + racy 规则），再对 want_ids（摘要里仍没有进度的书）
+        小线程池补缺。结果经 progressPulled；失败经 progressFailed（不抛）。单飞：已有一轮在跑则合并为「再跑一次」。
+        未启用 WebDAV 返回 None。"""
+        if self._factory(cfg) is None:
+            return None
+        with self._lock:
+            self._prog_job = (cfg, root, device_id, cursors, list(want_ids), force_full)
+            if self._prog_running:
+                return None
+            self._prog_running = True
+        t = threading.Thread(target=self._progress_loop, daemon=True)
+        t.start()
+        return t
+
+    def _progress_loop(self):
+        while True:
+            with self._lock:
+                job, self._prog_job = self._prog_job, None
+                if job is None:
+                    self._prog_running = False
+                    return
+            cfg, root, device_id, cursors, want, force_full = job
+            try:
+                client = self._factory(cfg)
+                if client is None:
+                    raise WebDavError("WebDAV 未启用")
+                user = cfg.get("sync_user_name") or "default"
+                if self._prog_cursors is not None:
+                    cursors = self._prog_cursors
+                peers = pull_peers(client, root, user, device_id, cursors, force_full=force_full)
+                self._prog_cursors = peers.cursors
+                digest = digest_progress(peers.views)
+                now = time.monotonic()
+                todo = [b for b in want if b not in digest and now - self._neg.get(b, -1e12) >= NEG_RETRY_SECONDS]
+                fill = pull_progress_index(client, user, todo) if todo else FillResult()
+                for b in fill.absent + fill.bad:
+                    self._neg[b] = now
+                for b in fill.found:
+                    self._neg.pop(b, None)
+                if len(self._neg) > 20000:
+                    self._neg.clear()
+                self.progress_generation += 1
+                self.progressPulled.emit(ProgressResult(peers, digest, fill.found, min(len(todo), FILL_PER_ROUND),
+                                                        peers.cursors, peers.requests + fill.requests))
+            except Exception as e:                   # 离线 / 401 / 5xx / 解析错误：只报告，绝不抛
+                _log_net(f"[书架] 进度同步失败: {e}")
+                try:
+                    self.progressFailed.emit(str(e)[:200])
+                except Exception:
+                    pass
+
+    # ------------------------------------------------------------ 推送设备文件（阶段 4：只含进度摘要）
+    def push_device(self, cfg: dict, device_id: str, payload: bytes, rev: int, digest: str) -> Optional[threading.Thread]:
+        """后台 PUT users/<me>/shelf/<device_id>.json。单飞且「最新者胜」：推送期间又来的新内容只留最后一份，当前这份完成后再推。
+        成功经 pushed(rev, digest, etag)；失败经 pushFailed。未启用 WebDAV 返回 None。"""
+        if self._factory(cfg) is None:
+            return None
+        with self._lock:
+            self._push_job = (cfg, device_id, payload, int(rev), digest)
+            if self._push_running:
+                return None
+            self._push_running = True
+        t = threading.Thread(target=self._push_loop, daemon=True)
+        t.start()
+        return t
+
+    def _push_loop(self):
+        while True:
+            with self._lock:
+                job, self._push_job = self._push_job, None
+                if job is None:
+                    self._push_running = False
+                    return
+            cfg, device_id, payload, rev, digest = job
+            try:
+                client = self._factory(cfg)
+                if client is None:
+                    raise WebDavError("WebDAV 未启用")
+                etag = push_device_file(client, cfg.get("sync_user_name") or "default", device_id, payload)
+                self.pushed.emit(rev, digest, etag)
+            except Exception as e:
+                _log_net(f"[书架] 推送设备文件失败: {e}")
+                try:
+                    self.pushFailed.emit(str(e)[:200])
+                except Exception:
+                    pass
+
+    # ------------------------------------------------------------ 手动上传（阶段 4）
+    def upload(self, cfg: dict, path: str, folder: str, name: str, token) -> Optional[threading.Thread]:
+        """后台上传一本书（见 upload_book_safe）。结果经 uploadDone(token, UploadResult)；绝不覆盖、绝不抛。
+        只由用户操作触发（没有任何自动上传）。未启用 WebDAV 返回 None。"""
+        client = self._factory(cfg)
+        if client is None:
+            return None
+        try:
+            mb = int(cfg.get("webdav_max_book_mb") or 0)
+        except (TypeError, ValueError):
+            mb = 0
+        max_bytes = mb * MB if mb > 0 else MAX_BOOK_BYTES
+
+        def run():
+            try:
+                res = upload_book_safe(client, path, folder, name, max_bytes=max_bytes)
+            except Exception as e:
+                _log_net(f"[书架] 上传异常 {name}: {e}")
+                res = UploadResult("error", name, f"上传失败：{str(e)[:120]}")
+            try:
+                self.uploadDone.emit(token, res)
             except Exception:
                 pass
         t = threading.Thread(target=run, daemon=True)

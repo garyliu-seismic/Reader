@@ -189,11 +189,16 @@ class WebDavClient:
         return r.status, r.body
 
     # ---- 操作 ----
-    def propfind(self, path: str = "", depth: int = 1, max_bytes: int = PROPFIND_MAX_BYTES) -> List[DavEntry]:
-        body = self._request_ex("PROPFIND", path, data=_PROPFIND_BODY,
+    def propfind(self, path: str = "", depth: int = 1, max_bytes: int = PROPFIND_MAX_BYTES,
+                 headers_out: Optional[dict] = None) -> List[DavEntry]:
+        """headers_out 给定时，把响应头（键小写）写进去（取服务器 Date 用：见 shelfsync 的 racy 判断）。"""
+        resp = self._request_ex("PROPFIND", path, data=_PROPFIND_BODY,
                                 headers={"Depth": str(depth),
                                          "Content-Type": "application/xml; charset=utf-8"},
-                                max_bytes=max_bytes).body
+                                max_bytes=max_bytes)
+        body = resp.body
+        if headers_out is not None:
+            headers_out.update(resp.headers)
         # WebDAV 响应不需要 DTD；拒绝 DOCTYPE/ENTITY 以杜绝实体膨胀（billion laughs）和外部实体
         low = body.lower()
         if b"<!doctype" in low or b"<!entity" in low:
@@ -297,6 +302,25 @@ class WebDavClient:
 
     def put(self, path: str, data: bytes, headers=None):
         self.put_ex(path, data, headers)
+
+    def put_file(self, path: str, fileobj, size: int, headers=None, ok_codes=None) -> DavResponse:
+        """流式 PUT：fileobj 是已打开的二进制文件，size 必须是要发送的字节数（写进 Content-Length；
+        大文件不进内存）。headers / ok_codes 同 put_ex。"""
+        h = {"Content-Type": "application/octet-stream", "Content-Length": str(int(size))}
+        h.update(headers or {})
+        try:
+            return self._request_ex("PUT", path, data=fileobj, headers=h, ok_codes=ok_codes)
+        except WebDavError as e:
+            if e.status in (404, 409):
+                self.forget_dirs()
+            raise
+
+    def move(self, src: str, dst: str, overwrite: bool = False, ok_codes=None) -> DavResponse:
+        """WebDAV MOVE（仅内部使用，如上传完成时 .part 改名；不向用户暴露）。overwrite=False 发 Overwrite: F，
+        目标已存在时服务器应回 412，调用方把 412 放进 ok_codes 自行处理。"""
+        return self._request_ex("MOVE", src, headers={"Destination": self._url(dst),
+                                                       "Overwrite": "T" if overwrite else "F"},
+                                ok_codes=ok_codes)
 
     def mkcol(self, path: str) -> bool:
         """创建单层目录；已存在（405）视为成功（返回 False 表示原本就在）。"""

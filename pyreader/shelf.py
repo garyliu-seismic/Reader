@@ -849,6 +849,35 @@ def set_progress(ov: dict, bid: str, percent: float, updated: Optional[float] = 
     ov["_rev"] = int(ov.get("_rev", 0)) + 1
 
 
+DIGEST_KEEP = 500                        # 设备文件里的进度摘要只留最近读过的这么多本（更早的靠逐书进度文件补缺）
+
+
+def prune_progress(ov: dict, keep: int = DIGEST_KEEP) -> int:
+    """进度摘要只保留 updated 最新的 keep 条（并列时 book_id 大者留下，保证确定性）。返回丢弃的条数；有丢弃才 _rev += 1。"""
+    prog = ov.get("progress") if isinstance(ov, dict) else None
+    if not isinstance(prog, dict) or len(prog) <= keep:
+        return 0
+    ranked = sorted(prog, key=lambda b: (_num((prog[b] or {}).get("updated"), 0.0), b), reverse=True)
+    drop = ranked[max(0, keep):]
+    for b in drop:
+        del prog[b]
+    ov["_rev"] = int(ov.get("_rev", 0)) + 1
+    return len(drop)
+
+
+def continue_candidate(books) -> Optional[Book]:
+    """「继续阅读」条显示哪一本：可见的、状态为「在读」的书里最近读过的一本（任一设备；last_read 已含
+    各设备进度摘要的 updated）。没有则 None。并列时 book_id 大者胜，保证确定性。"""
+    best, best_key = None, None
+    for b in (books.values() if isinstance(books, dict) else books):
+        if not _visible(b) or b.status != "reading" or b.last_read <= 0:
+            continue
+        key = (b.last_read, b.id)
+        if best_key is None or key > best_key:
+            best, best_key = b, key
+    return best
+
+
 # ================================================================== 上传白名单
 def to_wire(ov: dict, device_id: Optional[str] = None) -> dict:
     """上传内容只能由本函数构造：白名单 version / device_id / hostname / user / entries{meta,fav,hidden} / progress。

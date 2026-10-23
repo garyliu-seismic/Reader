@@ -208,17 +208,22 @@ class SyncWorker(QObject):
         return self._spawn(run)
 
     def upload_book(self, cfg: dict, path: str):
+        """上传到 library/ 根目录（旧入口，保留给兼容）。不再覆盖云端已有的同名文件：先查是否已存在，
+        走 .part + 完成校验（见 shelfsync.upload_book_safe）；书架里的「上传到云端…」对话框可选文件夹 / 改名。"""
         c = client_from_cfg(cfg)
         if not c:
             return None
 
         def run():
             try:
-                with open(path, "rb") as f:
-                    data = f.read()
-                c.mkdirs("library")
-                c.put("library/" + os.path.basename(path), data)
-                self.status.emit(f"已上传到远程书库：{os.path.basename(path)}")
+                from .shelfsync import upload_book_safe     # 延迟导入：shelfsync 反过来依赖本模块
+                res = upload_book_safe(c, path, "", os.path.basename(path))
+                if res.status == "error":
+                    self.status.emit(res.message if res.message.startswith("上传失败") else "上传失败：" + res.message)
+                elif res.status == "ok":
+                    self.status.emit(f"已上传到远程书库：{os.path.basename(path)}")
+                else:
+                    self.status.emit(res.message + "（未覆盖）")
             except Exception as e:
                 _log_net(f"[同步] 上传书失败: {e}")
                 self.status.emit("上传失败")
