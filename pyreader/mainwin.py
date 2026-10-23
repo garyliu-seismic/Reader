@@ -485,7 +485,7 @@ class MainWindow(QMainWindow):
         if not files:
             m.addAction("（远程书库为空）").setEnabled(False)
         m.addSeparator()
-        m.addAction("⬆️ 上传当前书到远程书库", self._upload_current_book)
+        m.addAction("⬆️ 上传当前书到云端书库…", self._upload_current_book)
 
     def _open_remote_book(self, rel, size):
         self.statusBar().showMessage(f"正在下载 {rel} …")
@@ -498,8 +498,7 @@ class MainWindow(QMainWindow):
         if not self.book_path or not os.path.isfile(self.book_path):
             self.statusBar().showMessage("请先打开一本书")
             return
-        self.statusBar().showMessage("正在上传…")
-        self.sync.upload_book(self.cfg, self.book_path)
+        self.shelf.start_upload([self.book_path])     # 确认对话框 -> 选文件夹 / 改名 -> 后台上传；云端已有同名文件时不覆盖
 
     def _current_progress_record(self):
         off = self.view.left_page_offset()
@@ -568,7 +567,8 @@ class MainWindow(QMainWindow):
             save_json(BOOKMARKS_PATH, self.bookmarks)
         except Exception:
             pass
-        self.shelf.note_progress(self.book_path, remote.get("percent", 0), remote.get("updated"), remote.get("device", ""))
+        self.shelf.note_progress(self.book_path, remote.get("percent", 0), remote.get("updated"), remote.get("device", ""),
+                                 local=False)       # 别的设备读的：不写进本设备的进度摘要
         self.statusBar().showMessage(
             f"☁️ 已同步进度（来自 {remote.get('device', '?')}，{remote.get('percent', 0):.1f}%）", 6000)
 

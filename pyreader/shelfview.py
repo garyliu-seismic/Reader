@@ -1,4 +1,5 @@
-"""阶段 2 / 3：书架界面（阶段 3 起云端书库并入：后台列 library/、角标、带 token 的下载后打开）。设计见 c:\\tmp\\pyreader-bookshelf-design.md §6、§7 阶段 2。
+"""阶段 2 / 3 / 4：书架界面（阶段 3 起云端书库并入：后台列 library/、角标、带 token 的下载后打开；
+阶段 4 起：设备文件的进度摘要写入与读取、进度条 / 最近阅读 / 在读 / 已读完、「继续阅读」条、手动上传对话框）。设计见 c:\\tmp\\pyreader-bookshelf-design.md §6、§7 阶段 2。
 
 结构：
   - ScanWorker  后台线程：scan_local + build_books（纯逻辑，不碰 Qt 对象），结果经 Signal 回主线程
@@ -13,13 +14,14 @@ import html
 import os
 import threading
 import time
-from typing import Callable, Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from PySide6.QtCore import (QAbstractTableModel, QModelIndex, QObject, QRect, QSize, Qt, QTimer, QUrl, Signal)
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontMetrics, QGuiApplication, QPainter, QPen
-from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-                               QListView, QListWidget, QListWidgetItem, QMenu, QPushButton, QStackedWidget,
-                               QStyle, QStyledItemDelegate, QToolButton, QTreeView, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QHBoxLayout, QHeaderView,
+                               QInputDialog, QLabel, QLineEdit, QListView, QListWidget, QListWidgetItem, QMenu,
+                               QMessageBox, QPushButton, QStackedWidget, QStyle, QStyledItemDelegate, QToolButton,
+                               QTreeView, QVBoxLayout, QWidget)
 
 from . import shelf as sh
 from . import shelfsync as ss
@@ -35,6 +37,15 @@ BADGES = {"cloud": "仅云端", "synced": "已下载", "local": "仅本地", "re
 BADGE_COLORS = {"cloud": "#2f7fd8", "synced": "#2e9a5b", "local": "#6b7280", "removed": "#d9822b"}
 CARD_W, CARD_H = 144, 240
 COVER_W, COVER_H = 116, 160
+PUSH_DEBOUNCE_MS = 5000              # 进度摘要：阅读事件之后等这么久再推送（合并连续的事件）
+PUSH_MIN_INTERVAL_MS = 60 * 1000     # 两次推送设备文件之间至少隔这么久（设备文件最多约 300KB，读书时不必每 30 秒推一次）
+OVERLAY_SAVE_MS = 5000               # overlay.json 防抖
+CONFIRM_TEXT = ("要把你的阅读进度同步到云端吗？\n\n"
+                "会上传到你的云端用户目录（users/<用户名>/shelf/）的内容：\n"
+                "  · 最近读过的书的书名标识和阅读进度（百分比、时间）\n"
+                "  · 本设备的名称\n"
+                "不会上传：本机文件路径、账号密码、任何设置。\n\n"
+                "之后读书时会自动更新这份进度（不会上传任何书）。")
 
 
 # ================================================================== 小工具（纯函数，便于测试）
@@ -92,6 +103,23 @@ def badge_text(b: sh.Book, busy: bool = False) -> str:
     if busy:
         return "下载中…"
     return BADGES.get(b.where, "")
+
+
+def continue_text(b: sh.Book, local_names=(), now: Optional[float] = None) -> str:
+    """「继续阅读」条的一行文字：继续阅读：《三体》  在 gary-phone 上读到 37%（3 小时前）。纯文本（调用方用 PlainText 显示）。"""
+    dev = (b.progress_device or "").strip()
+    where = "本机" if dev and dev in set(local_names) else dev
+    s = f"继续阅读：《{b.title}》"
+    if b.percent is not None:
+        s += f"  在 {where} 上读到 {b.percent:.0f}%" if where else f"  读到 {b.percent:.0f}%"
+    ago = fmt_ago(b.last_read, now)
+    return s + (f"（{ago}）" if ago else "")
+
+
+def suggest_name(name: str) -> str:
+    """撞名时给用户的改名建议：三体.epub -> 三体 (2).epub。"""
+    stem, ext = os.path.splitext(name)
+    return f"{stem or name} (2){ext}"
 
 
 def count_shelves(books) -> Dict[str, int]:
@@ -317,12 +345,114 @@ class BookDelegate(QStyledItemDelegate):
         p.restore()
 
 
+# ================================================================== 手动上传对话框（design §4.10）
+class UploadDialog(QDialog):
+    """上传前的确认对话框：选目标文件夹（已有的云端书架或新建）、（单个文件时）可改名、明确说明不会覆盖已有文件。
+    result_value()：(folder, [(本机路径, 云端文件名)])。名字 / 文件夹不合法时「上传」按钮不可用。"""
+    NEW = "__new__"
+
+    def __init__(self, items: List[Tuple[str, str]], folders: List[str], parent=None, default_folder: str = ""):
+        super().__init__(parent)
+        self.setWindowTitle("上传到云端书库")
+        self.items = list(items)
+        self.name_edit: Optional[QLineEdit] = None
+        lay = QVBoxLayout(self)
+        info = QLabel("将把下面的文件上传到云端书库（library/）。上传后你的其它设备和家人都能看到它。\n"
+                      "云端已有同名文件时不会覆盖，会让你改名。")
+        info.setTextFormat(Qt.TextFormat.PlainText)
+        info.setWordWrap(True)
+        lay.addWidget(info)
+        if len(self.items) == 1:
+            row = QHBoxLayout()
+            row.addWidget(QLabel("文件名"))
+            self.name_edit = QLineEdit(self.items[0][1])
+            self.name_edit.textChanged.connect(lambda _t: self._validate())
+            row.addWidget(self.name_edit, 1)
+            lay.addLayout(row)
+            src = QLabel("来自：" + self.items[0][0])
+            src.setTextFormat(Qt.TextFormat.PlainText)
+            src.setWordWrap(True)
+            lay.addWidget(src)
+        else:
+            self.file_list = QListWidget()
+            for path, name in self.items:
+                try:
+                    sz = fmt_size(os.path.getsize(path))
+                except OSError:
+                    sz = "?"
+                self.file_list.addItem(QListWidgetItem(f"{name}    {sz}"))      # QListWidgetItem 文本按纯文本显示
+            lay.addWidget(self.file_list)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("目标文件夹"))
+        self.folder_box = QComboBox()
+        self.folder_box.addItem("（根目录 / 未分类）", "")
+        for f in folders:
+            self.folder_box.addItem(f, f)
+        self.folder_box.addItem("新建文件夹…", self.NEW)
+        i = self.folder_box.findData(default_folder)
+        self.folder_box.setCurrentIndex(i if i >= 0 else 0)
+        self.folder_box.currentIndexChanged.connect(self._on_folder_changed)
+        row.addWidget(self.folder_box, 1)
+        lay.addLayout(row)
+        self.new_edit = QLineEdit()
+        self.new_edit.setPlaceholderText("新文件夹名（可用 / 分隔多层，如 小说/科幻）")
+        self.new_edit.textChanged.connect(lambda _t: self._validate())
+        self.new_edit.hide()
+        lay.addWidget(self.new_edit)
+        self.error = QLabel()
+        self.error.setTextFormat(Qt.TextFormat.PlainText)
+        self.error.setWordWrap(True)
+        lay.addWidget(self.error)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText("上传")
+        self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        lay.addWidget(self.buttons)
+        self._validate()
+
+    def _on_folder_changed(self, _i):
+        self.new_edit.setVisible(self.folder_box.currentData() == self.NEW)
+        self._validate()
+
+    def folder(self) -> Optional[str]:
+        d = self.folder_box.currentData()
+        return ss.normalize_folder(self.new_edit.text()) if d == self.NEW else d
+
+    def names(self) -> List[str]:
+        if self.name_edit is not None:
+            return [self.name_edit.text()]
+        return [n for _p, n in self.items]
+
+    def problem(self) -> str:
+        if self.folder() is None:
+            return "文件夹名不合法（不能含 \\ : 等字符，不能以 . 开头）"
+        for n in self.names():
+            if ss.upload_rel(self.folder(), n) is None:
+                return f"文件名不合法或不是支持的电子书格式：{n}"
+        if len({n.casefold() for n in self.names()}) != len(self.names()):
+            return "有重名的文件"
+        return ""
+
+    def _validate(self):
+        msg = self.problem()
+        self.error.setText(msg)
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(not msg)
+
+    def result_value(self):
+        if self.problem():
+            return None
+        return self.folder(), [(p, n) for (p, _n), n in zip(self.items, self.names())]
+
+
 # ================================================================== 书架页
 class ShelfView(QWidget):
     openRequested = Signal(str)          # 要打开的本地文件路径（由 MainWindow 调 load_book）
     addLibraryRequested = Signal()       # 空状态里的「添加书库目录…」
     scanFinished = Signal(int)           # 本轮扫描得到的书数（测试 / 状态用）
     cloudSynced = Signal(int)            # 一轮云端列表已并入书架（参数：云端书数）；测试 / 状态用
+    progressSynced = Signal(int)         # 一轮进度同步已并入（参数：得到的进度条数）；测试 / 状态用
+    uploadFinished = Signal(object)      # 一次上传结束（shelfsync.UploadResult）
 
     STALE_SECONDS = 60                   # 书架显示时，距上次扫描超过这个秒数才重新扫描
     INDEX_SAVE_MS = 5000                 # index.json 防抖
@@ -352,6 +482,28 @@ class ShelfView(QWidget):
         self._cloud.listFailed.connect(self._on_cloud_failed, Qt.ConnectionType.QueuedConnection)
         self._cloud.downloadedFor.connect(self._on_downloaded_for, Qt.ConnectionType.QueuedConnection)
         self._cloud.downloadFailed.connect(self._on_download_failed, Qt.ConnectionType.QueuedConnection)
+        self._cloud.progressPulled.connect(self._on_progress_pulled, Qt.ConnectionType.QueuedConnection)
+        self._cloud.progressFailed.connect(self._on_progress_failed, Qt.ConnectionType.QueuedConnection)
+        self._cloud.pushed.connect(self._on_pushed, Qt.ConnectionType.QueuedConnection)
+        self._cloud.pushFailed.connect(self._on_push_failed, Qt.ConnectionType.QueuedConnection)
+        self._cloud.uploadDone.connect(self._on_upload_done, Qt.ConnectionType.QueuedConnection)
+        # ---- 阶段 4：进度摘要 / 推送 / 上传。下面三个可调用对象供测试替换（默认弹真实对话框）
+        self.confirm_push: Callable[[], Optional[bool]] = self._default_confirm_push     # True 同意 / False 拒绝 / None 现在不问
+        self.upload_chooser: Callable = self._default_upload_chooser                     # (items, folders) -> (folder, [(path, name)]) | None
+        self.rename_chooser: Callable = self._default_rename_chooser                     # (name, folder, message) -> 新文件名 | None
+        self._overlay: Optional[dict] = None          # 本设备的覆盖层（阶段 4 只用其中的 progress 摘要）；主线程独占
+        self._overlay_dirty = False
+        self._push_declined = False                   # 本次会话用户拒绝了首次上传确认
+        self._push_inflight: Optional[tuple] = None   # (rev, hash)
+        self._push_error = ""
+        self._last_push: Optional[float] = None       # time.monotonic()
+        self._progress_due = False                    # 云端列表刚并入：扫描完成后做一轮进度同步
+        self._progress_busy = False
+        self._progress_error = ""
+        self._peers: Dict[str, dict] = {}             # 其它设备文件的校验视图（缓存 / 最近一轮）
+        self._upload_queue: List[tuple] = []          # [(本机路径, 文件夹, 云端文件名)]
+        self._upload_cur: Optional[tuple] = None      # (token, 路径, 文件夹, 名字)
+        self._upload_seq = 0
         self._cloud_busy = False                      # 列表读取中
         self._cloud_error = ""                        # 上次读取失败的原因（离线时显示本地缓存）
         self._cloud_ok_at: Optional[float] = None     # 上次成功的时间（time.time()）
@@ -386,6 +538,8 @@ class ShelfView(QWidget):
             self._books, self._opened, self._progress = cached
 
         self._catalog = ss.CloudCatalog(ss.known_from_books(self._books.values()), self._state["cloud"]["missing"])
+        self._peers = ss.load_cached_peers(root)           # 离线冷启动也能显示其它设备读到哪了
+        self._merge_progress(ss.digest_progress(self._peers))
         self._build_ui()
         self._cloud_timer = QTimer(self)
         self._cloud_timer.setInterval(CLOUD_TIMER_MS)
@@ -395,6 +549,13 @@ class ShelfView(QWidget):
         self._index_timer.setSingleShot(True)
         self._index_timer.setInterval(self.INDEX_SAVE_MS)
         self._index_timer.timeout.connect(self._save_index)
+        self._overlay_timer = QTimer(self)
+        self._overlay_timer.setSingleShot(True)
+        self._overlay_timer.setInterval(OVERLAY_SAVE_MS)
+        self._overlay_timer.timeout.connect(self._save_overlay)
+        self._push_timer = QTimer(self)
+        self._push_timer.setSingleShot(True)
+        self._push_timer.timeout.connect(lambda: self.maybe_push())
         self.set_view_mode(ui["view"], save=False)
         i = self.sort_box.findData(ui["sort"])
         self.sort_box.setCurrentIndex(i if i >= 0 else 0)
@@ -483,8 +644,21 @@ class ShelfView(QWidget):
         self.status.setTextFormat(Qt.TextFormat.PlainText)
         self.status.setWordWrap(True)
         self.model.show_badges = False
+        self.continue_label = QLabel()
+        self.continue_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.continue_btn = QPushButton("继续")
+        self.continue_btn.clicked.connect(self._on_continue_clicked)
+        self.continue_bar = QWidget()
+        cb = QHBoxLayout(self.continue_bar)
+        cb.setContentsMargins(0, 0, 0, 0)
+        cb.addWidget(QLabel("▶"))
+        cb.addWidget(self.continue_label, 1)
+        cb.addWidget(self.continue_btn)
+        self.continue_bar.hide()
+        self._continue_book: Optional[sh.Book] = None
         root = QVBoxLayout(self)
         root.addLayout(top)
+        root.addWidget(self.continue_bar)
         root.addLayout(body, 1)
         root.addWidget(self.status)
 
@@ -605,6 +779,7 @@ class ShelfView(QWidget):
         self.model.show_badges = self.cloud_enabled()
         self._rebuild_sidebar()
         self._apply_filter()
+        self._update_continue()
 
     def _roots(self) -> List[str]:
         try:
@@ -824,6 +999,7 @@ class ShelfView(QWidget):
         self.refresh()
         self._schedule_index_save()
         self.scanFinished.emit(len(self._books))
+        self._run_progress_if_due()
 
     def _on_scan_failed(self, token: int, msg: str):
         if token != self._token:
@@ -833,11 +1009,13 @@ class ShelfView(QWidget):
         self._last_scan = time.monotonic()
         self._update_status()
         self._update_content_page()
+        self._run_progress_if_due()
 
     def showEvent(self, e):
         super().showEvent(e)
         self.rescan_if_stale()
         self.sync_cloud_if_stale()
+        self.maybe_push()                          # 之前因为「不在书架上不弹确认」而推迟的进度推送
 
     # ------------------------------------------------------------ 云端（阶段 3）：全部网络在 ShelfSyncWorker 的后台线程
     def _cfg(self) -> dict:
@@ -865,6 +1043,12 @@ class ShelfView(QWidget):
                 s += f" · ⚠ 云端列表不完整（{lst.problem()}），暂不判断「云端已移除」"
             if lst.unstable:
                 s += f" · {len(lst.unstable)} 本正在上传，暂不显示"
+        if self._progress_busy:
+            s += " · 正在读取其它设备的进度…"
+        elif self._progress_error:
+            s += f" · 进度同步失败：{self._progress_error}"
+        if self.push_pending():
+            s += " · 阅读进度待上传" + (f"（{self._push_error}）" if self._push_error else "")
         return s
 
     def sync_cloud_if_stale(self) -> bool:
@@ -880,6 +1064,7 @@ class ShelfView(QWidget):
             return False
         self._cloud_tick = now
         self._cloud_busy = True
+        self._progress_due = True                  # 云端可达时顺带做一轮进度同步（列表并入、扫描完成之后）
         self._cloud.refresh(cfg)
         self._update_status()
         return True
@@ -910,6 +1095,7 @@ class ShelfView(QWidget):
     def _on_cloud_failed(self, msg: str):
         """离线 / 认证失败 / 服务器错误：保留本地缓存（书、索引、已移除计数都不动），只在状态条报告。"""
         self._cloud_busy = False
+        self._progress_due = False
         self._cloud_error = (msg or "未知错误")[:120]
         self._update_status()
         self._update_content_page()
@@ -983,8 +1169,11 @@ class ShelfView(QWidget):
             self.refresh()
         self._schedule_index_save()
 
-    def note_progress(self, path: str, percent: float, updated: Optional[float] = None, device: str = ""):
-        """阅读页保存了进度：记百分比（书签里只有字符偏移，没有百分比；已读完 / 进度条靠这条）。"""
+    def note_progress(self, path: str, percent: float, updated: Optional[float] = None, device: str = "",
+                      local: bool = True):
+        """阅读页保存了进度：记百分比（书签里只有字符偏移，没有百分比；已读完 / 进度条靠这条）。
+        local=True（默认）：这是本设备上的阅读事件，同时写进本设备设备文件的进度摘要（启用云同步时）；
+        local=False：只是把别的设备的进度应用到本机，不当作本设备读过的记录写进摘要。"""
         bid = self._book_id(path)
         if not bid or not sh.valid_book_id(bid):
             return
@@ -1000,6 +1189,8 @@ class ShelfView(QWidget):
         if b and sh.note_progress(b, p, u, device):
             self.refresh()
         self._schedule_index_save()
+        if local:
+            self._record_digest(bid, p, u)
 
     # ------------------------------------------------------------ index.json（主线程写，防抖）
     def _schedule_index_save(self):
@@ -1019,7 +1210,305 @@ class ShelfView(QWidget):
     def flush(self):
         """关闭窗口 / 退出前：立刻落盘未保存的索引与 UI 状态。"""
         self._save_index()
+        self._save_overlay()
         self._save_ui()
+
+    # ------------------------------------------------------------ 进度摘要（阶段 4）：本设备写、其它设备读
+    def _sync_user(self) -> str:
+        return self._cfg().get("sync_user_name") or "default"
+
+    def _ensure_overlay(self) -> Optional[dict]:
+        """本设备覆盖层（懒加载，主线程独占）。同步用户名不合法 / 更高主版本的只读文件 -> None。"""
+        if ss.check_user(self._sync_user()) is None:
+            return None
+        if self._overlay is None:
+            self._overlay = sh.load_overlay(self._root, self._state["device_id"], user=self._sync_user())
+        return None if self._overlay.get("_readonly") else self._overlay
+
+    def _merge_progress(self, recs: Dict[str, dict]) -> bool:
+        """把别的设备 / 逐书补缺得到的进度并入 self._progress：updated 大者胜（本设备更新的读数不会被旧记录盖掉）。"""
+        changed = False
+        for bid, rec in (recs or {}).items():
+            if not sh.valid_book_id(bid) or not isinstance(rec, dict):
+                continue
+            p, u = sh._num(rec.get("percent")), sh._num(rec.get("updated"))
+            if p is None or u is None or p < 0 or u <= 0:
+                continue
+            old = self._progress.get(bid)
+            if old is None or u > old["updated"]:
+                self._progress[bid] = {"percent": min(100.0, p), "updated": u, "device": str(rec.get("device") or "")[:64]}
+                changed = True
+        return changed
+
+    def _record_digest(self, bid: str, percent: float, updated: float):
+        """本设备读到了哪：写进覆盖层的 progress 摘要（内存，主线程）；防抖落盘 overlay.json、防抖推送设备文件。
+        未启用云同步是空操作（不创建任何书架文件）。"""
+        if not self.cloud_enabled():
+            return
+        ov = self._ensure_overlay()
+        if ov is None:
+            self._notice = "同步用户名不合法，阅读进度不会同步到其它设备"
+            self._update_status()
+            return
+        try:
+            sh.set_progress(ov, bid, percent, updated)
+            sh.prune_progress(ov)
+        except ValueError:
+            return
+        self._overlay_dirty = True
+        self._overlay_timer.start()
+        self._schedule_push()
+
+    def _save_overlay(self):
+        """原子写 overlay.json（内容 = to_wire，同时就是上传内容）。"""
+        self._overlay_timer.stop()
+        if not self._overlay_dirty or self._overlay is None:
+            return
+        self._overlay_dirty = False
+        try:
+            if not sh.save_overlay(self._overlay, self._root):
+                return
+        except (OSError, ValueError):
+            self._overlay_dirty = True
+
+    def push_pending(self) -> bool:
+        """本设备的进度摘要有还没上传的内容。"""
+        ov = self._overlay
+        if ov is None or ov.get("_readonly") or not self.cloud_enabled():
+            return False
+        if not ov.get("progress") and not ov.get("entries") and not self._state.get("pushed_hash"):
+            return False                              # 从没写过任何东西：不需要（也不应该）创建空的设备文件
+        try:
+            return sh.wire_hash(ov) != self._state.get("pushed_hash", "")
+        except ValueError:
+            return False
+
+    def _schedule_push(self):
+        if self._push_timer.isActive():
+            return
+        delay = PUSH_DEBOUNCE_MS
+        if self._last_push is not None:
+            delay = max(delay, PUSH_MIN_INTERVAL_MS - int((time.monotonic() - self._last_push) * 1000))
+        self._push_timer.start(delay)
+
+    def _default_confirm_push(self) -> Optional[bool]:
+        """首次向云端写书架数据前的确认（design §5）。书架不在前台时不打扰（返回 None：以后再问）。"""
+        if not self.isVisible():
+            return None
+        r = QMessageBox.question(self, "同步阅读进度", CONFIRM_TEXT, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                 QMessageBox.StandardButton.No)
+        return r == QMessageBox.StandardButton.Yes
+
+    def _push_allowed(self) -> bool:
+        if self._state.get("confirmed_upload"):
+            return True
+        if self._push_declined:
+            return False
+        ans = self.confirm_push()
+        if ans is None:
+            return False                              # 现在不问：保持待推送
+        if not ans:
+            self._push_declined = True                # 本次会话不再问；进度仍只存本机
+            return False
+        self._state["confirmed_upload"] = True
+        self._save_ui()
+        return True
+
+    def maybe_push(self, force: bool = False) -> bool:
+        """有待上传的摘要就推送设备文件（后台线程）。未启用云同步 / 没有待推送内容 / 已有同内容在推送 / 用户没确认：返回 False。
+        首次写入前必须经过确认对话框（confirmed_upload 记在 state.json）。"""
+        self._push_timer.stop()
+        if not self.cloud_enabled() or self._ensure_overlay() is None or not self.push_pending():
+            return False
+        ov = self._overlay
+        h = sh.wire_hash(ov)
+        if self._push_inflight is not None and self._push_inflight[1] == h:
+            return False
+        if not self._push_allowed():
+            return False
+        self._save_overlay()
+        payload, rev = sh.wire_bytes(ov), int(ov.get("_rev", 0))
+        self._push_inflight = (rev, h)
+        self._last_push = time.monotonic()
+        self._cloud.push_device(self._cfg(), self._state["device_id"], payload, rev, h)
+        self._update_status()
+        return True
+
+    def _on_pushed(self, rev: int, digest: str, etag: str):
+        self._push_error = ""
+        if self._push_inflight is not None and self._push_inflight[1] == digest:
+            self._push_inflight = None                # 先到的旧内容的完成通知不能清掉更新内容的「在途」标记
+        self._state["pushed_hash"] = digest
+        self._state["pushed_rev"] = int(rev)
+        self._save_ui()
+        if self.push_pending():                       # 推送期间又有新的阅读事件：不能当作已清空，再推一轮
+            self._schedule_push()
+        self._update_status()
+
+    def _on_push_failed(self, msg: str):
+        self._push_inflight = None
+        self._push_error = (msg or "未知错误")[:80]
+        self._update_status()
+
+    # ------------------------------------------------------------ 进度同步（阶段 4）：其它设备的摘要 + 逐书补缺
+    def progress_wanted(self) -> List[str]:
+        """还没有任何进度信息的书（不在任何设备摘要里）：先试最近读过的，再按书名；其它设备的占位 / 已移除且无副本的不探测。"""
+        out = []
+        for b in sorted(self._books.values(), key=lambda b: (-b.last_read, b.title.casefold(), b.id)):
+            if b.percent is None and not b.placeholder and not (b.removed and not b.local_paths) and sh.valid_book_id(b.id):
+                out.append(b.id)
+        return out
+
+    def _run_progress_if_due(self):
+        if self._progress_due:
+            self._progress_due = False
+            self.sync_progress()
+
+    def sync_progress(self, force_full: bool = False) -> bool:
+        """后台读其它设备的进度摘要（游标 + racy 规则）并给摘要里没有的书逐本补缺。未启用云同步是空操作。"""
+        cfg = self._cfg()
+        if client_from_cfg(cfg) is None:
+            return False
+        self._progress_busy = True
+        self._cloud.sync_progress(cfg, self._root, self._state["device_id"], self._state["cursors"],
+                                  self.progress_wanted(), force_full)
+        self._update_status()
+        return True
+
+    def _on_progress_pulled(self, res):
+        self._progress_busy = False
+        self._progress_error = ""
+        if not self.cloud_enabled():
+            return
+        self._peers = res.peers.views
+        self._state["cursors"] = res.cursors
+        self._save_ui()
+        changed = self._merge_progress(res.digest)
+        changed = self._merge_progress(res.found) or changed
+        if changed:
+            self._schedule_index_save()
+            self.rescan(force=True, reuse=True)       # 只重建（不遍历磁盘）：本地书、云端书、local: 别名下的进度一并对上
+        self._update_continue()
+        self._update_status()
+        self.progressSynced.emit(len(res.digest) + len(res.found))
+        self.maybe_push()                             # 云端刚确认可达：把之前（离线 / 重启前）没推上去的摘要补推
+
+    def _on_progress_failed(self, msg: str):
+        self._progress_busy = False
+        self._progress_error = (msg or "未知错误")[:80]
+        self._update_status()
+
+    # ------------------------------------------------------------ 「继续阅读」条
+    def _local_device_names(self) -> Set[str]:
+        from . import sync as syncmod
+        return {n for n in (self._cfg().get("device_name"), syncmod.default_device_name()) if n}
+
+    def _update_continue(self):
+        b = sh.continue_candidate(self._books)
+        self._continue_book = b
+        if b is None:
+            self.continue_bar.hide()
+            return
+        self.continue_label.setText(continue_text(b, self._local_device_names()))
+        self.continue_bar.show()
+
+    def _on_continue_clicked(self):
+        b = self._continue_book
+        if b is not None and b.id in self._books:
+            self.open_book(b)             # 远端较新则静默跳转 + 状态栏提示：由 load_book 里已有的 sync.pull 流程负责
+
+    # ------------------------------------------------------------ 手动上传（阶段 4，design §4.10）：只由用户操作触发
+    def _cloud_folders(self) -> List[str]:
+        return sorted({b.shelf[len(sh.CLOUD):] for b in self._books.values()
+                       if b.shelf.startswith(sh.CLOUD) and b.shelf != sh.CLOUD}, key=lambda f: f.casefold())
+
+    def _default_upload_chooser(self, items, folders):
+        dlg = UploadDialog(items, folders, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return dlg.result_value()
+
+    def _default_rename_chooser(self, name: str, folder: str, message: str):
+        text = suggest_name(name)
+        while True:
+            text, ok = QInputDialog.getText(self, "云端已有同名文件", message + "\n不会覆盖它。请输入新的文件名：",
+                                            QLineEdit.EchoMode.Normal, text)
+            if not ok:
+                return None
+            if ss.upload_rel(folder, text) is not None:
+                return text
+            QMessageBox.warning(self, "文件名不合法", "文件名不合法或不是支持的电子书格式，请重新输入。")
+
+    def start_upload(self, paths) -> bool:
+        """上传本机的书到云端书库（弹确认对话框 -> 选文件夹 / 改名 -> 后台上传）。绝不自动调用、绝不覆盖云端已有文件。
+        已经是云端缓存副本（remote_books/ 下）的文件、不存在的文件、不支持的格式 / 名字会被跳过并提示。"""
+        if not self.cloud_enabled():
+            self._notice = "未启用云同步，无法上传"
+            self._update_status()
+            return False
+        from . import sync as syncmod
+        items, skipped = [], []
+        for p in paths or ():
+            if not isinstance(p, str) or not os.path.isfile(p):
+                continue
+            name = os.path.basename(p)
+            if syncmod._remote_rel(p) is not None:
+                skipped.append(f"{name}（已经在云端）")
+            elif ss.upload_rel("", name) is None:
+                skipped.append(f"{name}（不是支持的电子书格式或文件名不合法）")
+            else:
+                items.append((p, name))
+        if not items:
+            self._notice = "没有可上传的文件：" + "；".join(skipped) if skipped else "没有可上传的文件"
+            self._update_status()
+            return False
+        choice = self.upload_chooser(items, self._cloud_folders())
+        if not choice:
+            return False
+        folder, picked = choice
+        if ss.normalize_folder(folder) is None:
+            return False
+        for path, name in picked:
+            self._upload_queue.append((path, ss.normalize_folder(folder), name))
+        self._notice = "；".join(skipped)
+        self._pump_uploads()
+        return True
+
+    def _pump_uploads(self):
+        if self._upload_cur is not None or not self._upload_queue:
+            return
+        path, folder, name = self._upload_queue.pop(0)
+        self._upload_seq += 1
+        tok = self._upload_seq
+        self._upload_cur = (tok, path, folder, name)
+        self._notice = f"正在上传：{name}"
+        self._update_status()
+        if self._cloud.upload(self._cfg(), path, folder, name, tok) is None:
+            self._upload_cur = None
+            self._notice = "未启用云同步，无法上传"
+            self._update_status()
+
+    def _on_upload_done(self, tok, res):
+        cur = self._upload_cur
+        if cur is None or cur[0] != tok:
+            return
+        _t, path, folder, name = cur
+        self._upload_cur = None
+        if res.status == "ok":
+            self._notice = res.message + "（其它设备约 1 分钟后能看到）"
+            self.sync_cloud(force=True)
+        elif res.status == "exists":
+            new = self.rename_chooser(name, folder, res.message)
+            if new and new != name and ss.upload_rel(folder, new) is not None:
+                self._upload_queue.insert(0, (path, folder, new))
+                self._notice = f"云端已有同名文件，改名为 {new} 重试"
+            else:
+                self._notice = f"已跳过（云端已有同名文件，未覆盖）：{name}"
+        else:
+            self._notice = res.message or "上传失败"
+        self._update_status()
+        self.uploadFinished.emit(res)
+        self._pump_uploads()
 
     # ------------------------------------------------------------ 交互
     def _on_activated(self, index: QModelIndex):
@@ -1059,6 +1548,8 @@ class ShelfView(QWidget):
         m.addAction("打开", lambda: self.open_book(b))
         if b.remote_rel and not b.local_paths and not b.removed and self.cloud_enabled():
             m.addAction("下载到本机", lambda: self.request_download(b, open_when_done=False))
+        if b.where == "local" and b.local_paths and self.cloud_enabled():
+            m.addAction("上传到云端…（手动，需确认）", lambda: self.start_upload([b.local_paths[0]]))
         if b.remote_rel:
             m.addAction("复制云端路径", lambda: QGuiApplication.clipboard().setText("library/" + b.remote_rel))
         if b.local_paths:

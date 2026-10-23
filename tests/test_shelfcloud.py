@@ -67,7 +67,8 @@ def make_view(tmp_path, url, dirs=(), cloud=None, root="home", cfg=None):
 
 
 def settle(v):
-    assert wait_for(lambda: not v.scanning and not v._cloud_busy and not v._cloud._running), "云端同步 / 扫描没有在时限内结束"
+    assert wait_for(lambda: not v.scanning and not v._cloud_busy and not v._cloud._running
+                    and not v._cloud._prog_running and not v._progress_busy), "云端同步 / 扫描没有在时限内结束"
 
 
 def sync_wait(v):
