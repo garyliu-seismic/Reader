@@ -258,6 +258,11 @@ class MainWindow(QMainWindow):
         self.recent_menu = QMenu("最近打开", self)
         self.recent_act = tb.addAction("🕘 最近")
         self.recent_act.setMenu(self.recent_menu)
+        # 书库目录（如移动云盘同步文件夹）：每次展开菜单时重新扫描，新同步的书自动出现
+        self.library_menu = QMenu("书库", self)
+        self.library_menu.aboutToShow.connect(self._rebuild_library_menu)
+        self.library_act = tb.addAction("📚 书库")
+        self.library_act.setMenu(self.library_menu)
         tb.addSeparator()
         # AI 辅助功能组
         ai_menu = QMenu("AI 功能", self)
@@ -302,9 +307,62 @@ class MainWindow(QMainWindow):
                 "outer": c.get("outer", OUTER), "gutter": c.get("gutter", GUTTER),
                 "para_spacing": c.get("para_spacing", PARA_SPACING)}
 
+    BOOK_EXTS = (".txt", ".md", ".markdown", ".epub", ".html", ".htm", ".mobi",
+                 ".azw", ".azw3", ".prc", ".pdf", ".docx", ".pptx")
+    LIBRARY_MAX_FILES = 300
+
+    def _rebuild_library_menu(self):
+        m = self.library_menu
+        m.clear()
+        dirs = [d for d in self.cfg.get("library_dirs", []) if os.path.isdir(d)]
+        for d in dirs:
+            sub = m.addMenu(os.path.basename(d.rstrip("\\/")) or d)
+            sub.setToolTipsVisible(True)
+            files = []
+            for root, _dn, fns in os.walk(d):
+                for fn in fns:
+                    if fn.lower().endswith(self.BOOK_EXTS) and not fn.startswith((".", "~$")):
+                        p = os.path.join(root, fn)
+                        try:
+                            files.append((os.path.getmtime(p), p))
+                        except OSError:
+                            pass
+            files.sort(reverse=True)  # 最近同步/修改的在前
+            for _t, p in files[:self.LIBRARY_MAX_FILES]:
+                a = sub.addAction(os.path.relpath(p, d), lambda p=p: self.load_book(p))
+                a.setToolTip(p)
+            if not files:
+                sub.addAction("（没有找到电子书）").setEnabled(False)
+            elif len(files) > self.LIBRARY_MAX_FILES:
+                sub.addAction(f"…仅显示最新 {self.LIBRARY_MAX_FILES} 本").setEnabled(False)
+        if dirs:
+            m.addSeparator()
+        m.addAction("➕ 添加书库目录…", self._add_library_dir)
+        if self.cfg.get("library_dirs"):
+            rm = m.addMenu("➖ 移除书库目录")
+            for d in self.cfg["library_dirs"]:
+                rm.addAction(d, lambda d=d: self._remove_library_dir(d))
+
+    def _add_library_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "选择书库目录（如移动云盘同步文件夹）")
+        if not d:
+            return
+        d = os.path.normpath(d)
+        dirs = list(self.cfg.get("library_dirs", []))
+        if d not in dirs:
+            dirs.append(d)
+            self.cfg["library_dirs"] = dirs
+            save_json(CONFIG_PATH, self.cfg)
+
+    def _remove_library_dir(self, d):
+        self.cfg["library_dirs"] = [x for x in self.cfg.get("library_dirs", []) if x != d]
+        save_json(CONFIG_PATH, self.cfg)
+
     def open_book(self):
+        libs = self.cfg.get("library_dirs", [])
+        start = libs[0] if libs and os.path.isdir(libs[0]) else ""
         path, _ = QFileDialog.getOpenFileName(
-            self, "打开小说", "",
+            self, "打开小说", start,
             "电子书 (*.txt *.md *.markdown *.epub *.html *.htm *.mobi *.azw *.azw3 *.prc *.pdf *.docx *.pptx);;文本 (*.txt *.md *.markdown);;EPUB (*.epub);;Kindle (*.mobi *.azw *.azw3 *.prc);;网页 (*.html *.htm);;PDF (*.pdf);;Word (*.docx);;PowerPoint (*.pptx)")
         if path:
             self.load_book(path)

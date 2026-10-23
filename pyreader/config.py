@@ -208,7 +208,7 @@ DEFAULT_CONFIG = {"font_family": "", "font_size": 15,
                   "proxy": "",
                   "azure_tts_key": "", "azure_tts_region": "",
                   "azure_tts_key2": "", "azure_tts_region2": "",
-                  "theme": DEFAULT_THEME, "recent": [],
+                  "theme": DEFAULT_THEME, "recent": [], "library_dirs": [],
                   "bilingual": False, "bilingual_target": "中文",
                   "flip_effect": DEFAULT_FLIP_EFFECT,
                   "single_page": False}
