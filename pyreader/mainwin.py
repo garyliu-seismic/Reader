@@ -262,8 +262,9 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("就绪")
         self.resize(1280, 800)
         # 启动页：指定了书 → 阅读页（load_book 会切页）；否则「启动时显示书架」或没有可用的最近阅读 → 书架
-        has_recent = any(isinstance(p, str) and os.path.exists(p) for p in self.cfg.get("recent", []))
-        start_shelf = (not book_path) and (bool(self.cfg.get("shelf_start_in_shelf", False)) or not has_recent)
+        has_recent = any(isinstance(p, str) and os.path.exists(p) and not shelfmod.is_external(p)
+                         for p in self.cfg.get("recent", []))
+        start_shelf = (not book_path or shelfmod.is_external(book_path)) and (bool(self.cfg.get("shelf_start_in_shelf", False)) or not has_recent)
         self.stack.setCurrentIndex(0 if start_shelf else 1)
         self._sync_page_state()
         QTimer.singleShot(300, self.shelf.rescan_if_stale)   # 先用 index.json 缓存画界面，稍后后台增量扫描
@@ -408,6 +409,9 @@ class MainWindow(QMainWindow):
 
     def _open_from_shelf(self, path):
         """书架双击 / 回车：先切页再加载（load_book 内部保证）；加载失败则回书架。"""
+        if shelfmod.is_external(path):         # 外部格式不进阅读器：交给系统应用，不设「失败回书架」标记
+            self.shelf.launch_file(path)
+            return
         self.load_book(path)
         self._shelf_open_pending = True
 
@@ -437,8 +441,7 @@ class MainWindow(QMainWindow):
                 "outer": c.get("outer", OUTER), "gutter": c.get("gutter", GUTTER),
                 "para_spacing": c.get("para_spacing", PARA_SPACING)}
 
-    BOOK_EXTS = (".txt", ".md", ".markdown", ".epub", ".html", ".htm", ".mobi",
-                 ".azw", ".azw3", ".prc", ".pdf", ".docx", ".pptx")
+    BOOK_EXTS = shelfmod.READABLE_EXTS      # Library / 云端书库菜单只列阅读器能打开的格式（有声书 / 漫画压缩包只在书架）
     LIBRARY_MAX_FILES = 300
 
     def _rebuild_library_menu(self):
@@ -603,11 +606,14 @@ class MainWindow(QMainWindow):
         start = libs[0] if libs and os.path.isdir(libs[0]) else ""
         path, _ = QFileDialog.getOpenFileName(
             self, "打开小说", start,
-            "电子书 (*.txt *.md *.markdown *.epub *.html *.htm *.mobi *.azw *.azw3 *.prc *.pdf *.docx *.pptx);;文本 (*.txt *.md *.markdown);;EPUB (*.epub);;Kindle (*.mobi *.azw *.azw3 *.prc);;网页 (*.html *.htm);;PDF (*.pdf);;Word (*.docx);;PowerPoint (*.pptx)")
+            "电子书 (" + " ".join("*" + e for e in shelfmod.READABLE_EXTS) + ");;文本 (*.txt *.md *.markdown);;EPUB (*.epub);;Kindle (*.mobi *.azw *.azw3 *.prc);;网页 (*.html *.htm);;PDF (*.pdf);;Word (*.docx);;PowerPoint (*.pptx)")
         if path:
             self.load_book(path)
 
     def load_book(self, path):
+        if shelfmod.is_external(path):       # 有声书 / 漫画压缩包：阅读器读不了，必须在切页、记进度、起 loader 之前拦下
+            self.shelf.launch_file(path)
+            return
         self.show_reader()                   # 先切到阅读页，再启动 loader（几何见 show_reader 的说明）
         self._shelf_open_pending = False
         self.shelf.note_opened(path)
@@ -1596,7 +1602,7 @@ class MainWindow(QMainWindow):
     def _rebuild_recent_menu(self):
         self.recent_menu.clear()
         for p in self.cfg.get("recent", []):
-            if os.path.exists(p):
+            if os.path.exists(p) and not shelfmod.is_external(p):
                 self.recent_menu.addAction(os.path.basename(p), lambda p=p: self.load_book(p))
         if self.recent_menu.isEmpty():
             self.recent_menu.addAction("（暂无）").setEnabled(False)
