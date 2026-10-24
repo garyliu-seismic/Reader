@@ -31,7 +31,7 @@ def test_every_widget_mainwin_reads_still_exists_and_is_on_some_tab():
     names = ["preset", "key", "base", "model", "api_version", "font_family", "theme", "flip_effect", "single_page",
              "font_size", "line_spacing", "para_spacing", "margin_x", "margin_y", "outer", "gutter", "tts_voice",
              "azure_key", "azure_region", "azure_key2", "azure_region2", "tts_rate", "proxy", "webdav_enabled",
-             "webdav_url", "webdav_user", "webdav_password", "webdav_allow_insecure", "sync_user_name", "device_name",
+             "webdav_url", "webdav_user", "webdav_password", "webdav_allow_insecure", "webdav_max_book", "sync_user_name", "device_name",
              "shelf_view", "shelf_sort", "shelf_start", "shelf_reset", "bilingual", "bilingual_target"]
     for n in names:
         w = getattr(d, n)
