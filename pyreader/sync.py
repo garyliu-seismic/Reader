@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import socket
 import threading
 import time
@@ -32,6 +33,29 @@ def max_book_bytes(cfg) -> int:
     if mb < 0:
         return 1 << 62
     return mb * 1024 * 1024 if mb > 0 else MAX_BOOK_BYTES
+
+
+DISK_MARGIN = 16 * 1024 * 1024           # 下载前要求的额外剩余空间（给 .part 之外的写入留余地）
+_SWEPT: set = set()
+
+
+def sweep_stale_parts(root: Optional[str] = None) -> int:
+    """清掉 remote_books 里上次异常退出（崩溃 / 下载到一半关程序）留下的 *.part，返回清了几个。
+    只在启动时、且本进程拿到了书架单实例锁时调用（否则会删掉另一个进程正在下载的 .part）；每个目录每进程只扫一次。"""
+    root = os.path.abspath(root or REMOTE_BOOKS_DIR)
+    if root in _SWEPT:
+        return 0
+    _SWEPT.add(root)
+    n = 0
+    for d, _dirs, files in os.walk(root):
+        for f in files:
+            if f.endswith(".part"):
+                try:
+                    os.remove(os.path.join(d, f))
+                    n += 1
+                except OSError:
+                    pass
+    return n
 
 
 def default_device_name() -> str:
@@ -116,13 +140,15 @@ def resolve_offset(rec: dict, text_len: int) -> int:
 
 
 def download_book(client: WebDavClient, rel: str, size: int, dest_root: Optional[str] = None,
-                  max_bytes: int = MAX_BOOK_BYTES, should_cancel=None) -> str:
+                  max_bytes: int = MAX_BOOK_BYTES, should_cancel=None, progress=None) -> str:
     """把 library/<rel> 下载到 <dest_root>/<rel>（默认 remote_books），返回本地路径。阻塞调用，只能在后台线程用。
 
     - rel 必须是合法相对路径且不含点 / ~$ 开头的段（来自服务器的名字不可信），目标必须落在 dest_root 之内。
     - 本地已有同大小的文件则直接复用（size > 0 时）。
     - 先流式写入 <dest>.part，字节数必须等于列表给出的 size（size <= 0 表示列表没给大小，只校验 Content-Length），
-      不符则丢弃 .part、不动旧文件并抛 WebDavError；成功后才 os.replace 成最终路径。"""
+      不符则丢弃 .part、不动旧文件并抛 WebDavError；成功后才 os.replace 成最终路径。
+    - 列表给了 size 时，下载前先查磁盘剩余空间（size + 16MB），不够直接报错，不去写满磁盘。
+    - progress(已收字节, 总字节)：下载进度回调（调用方节流）。"""
     if normalize_rel(rel) is None or any(is_hidden_name(s) for s in rel.split("/")):
         raise WebDavError("illegal path")
     root = os.path.abspath(dest_root or REMOTE_BOOKS_DIR)
@@ -133,10 +159,18 @@ def download_book(client: WebDavClient, rel: str, size: int, dest_root: Optional
     if size > 0 and os.path.isfile(dest) and os.path.getsize(dest) == size:
         return dest
     os.makedirs(os.path.dirname(dest), exist_ok=True)
+    if size > 0:
+        try:
+            free = shutil.disk_usage(os.path.dirname(dest)).free
+        except OSError:
+            free = None                      # 查不到就不拦：交给写盘时的 OSError
+        if free is not None and free < size + DISK_MARGIN:
+            raise WebDavError(f"磁盘空间不足：需要 {size // (1024 * 1024)} MB，剩余 {free // (1024 * 1024)} MB")
     tmp = dest + ".part"
+    kw = {"progress": (lambda n, e: progress(n, size or e))} if progress is not None else {}
     try:
         with open(tmp, "wb") as f:
-            n = client.get_to_file("library/" + rel, f, max_bytes=max_bytes, should_cancel=should_cancel)
+            n = client.get_to_file("library/" + rel, f, max_bytes=max_bytes, should_cancel=should_cancel, **kw)
         if size > 0 and n != size:
             raise WebDavError(f"size mismatch for {rel}: got {n} bytes, expected {size}")
         os.replace(tmp, dest)

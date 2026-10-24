@@ -15,7 +15,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from .config import net_urlopen
 from .store import is_hidden_name, safe_segment
@@ -257,9 +257,10 @@ class WebDavClient:
         return self.get_ex(path, max_bytes).body
 
     def get_to_file(self, path: str, fileobj, max_bytes: Optional[int] = None, chunk: int = 65536,
-                    should_cancel=None) -> int:
+                    should_cancel=None, progress: Optional[Callable[[int, int], None]] = None) -> int:
         """流式 GET：按块写入已打开的二进制文件对象，返回写入字节数（大文件不进内存）。
-        超过 max_bytes、响应体短于 Content-Length（连接被截断）或 should_cancel() 为真都抛 WebDavError。"""
+        超过 max_bytes、响应体短于 Content-Length（连接被截断）或 should_cancel() 为真都抛 WebDavError。
+        progress(已收字节, Content-Length 或 0)：每块回调一次（调用方自行节流）；回调抛错不影响下载。"""
         what = f"GET {path or '/'}"
         req = urllib.request.Request(self._url(path), method="GET", headers=self._headers())
         try:
@@ -279,6 +280,11 @@ class WebDavClient:
                     if max_bytes is not None and total > max_bytes:
                         raise WebDavError(f"{what}: response too large (> {max_bytes})")
                     fileobj.write(buf)
+                    if progress is not None:
+                        try:
+                            progress(total, expect or 0)
+                        except Exception:
+                            pass
                 if expect is not None and total != expect:
                     raise WebDavError(f"{what}: truncated response ({total} of {expect} bytes)")
                 return total
@@ -363,11 +369,12 @@ class WebDavClient:
         return st != 404
 
     def list_tree_ex(self, path: str = "", max_files: int = MAX_FILES, max_dirs: int = MAX_DIRS,
-                     max_depth: int = MAX_DEPTH) -> TreeResult:
+                     max_depth: int = MAX_DEPTH, accept: Optional[Callable[[str], bool]] = None) -> TreeResult:
         """递归列出文件。根不存在/不可读则抛 WebDavError；子树失败或触到上限不抛，而是 complete=False。
 
         过滤：'.'、'..'、含反斜杠/冒号/控制字符/Windows 保留名的名字，以及 '.' 或 '~$' 开头的文件和目录。
-        用已访问集合防止同一目录被重复列出；目录数/深度/文件数都有上限。"""
+        用已访问集合防止同一目录被重复列出；目录数/深度/文件数都有上限。
+        accept(相对路径)：不接受的文件计入 skipped，且不占 max_files 名额（有声书文件夹里的封面 / .cue / .nfo 不该挤掉书）。"""
         res = TreeResult([])
         seen_files = set()
         visited = {""}
@@ -403,6 +410,9 @@ class WebDavClient:
                 else:
                     key = unicodedata.normalize("NFC", r)
                     if key in seen_files:
+                        continue
+                    if accept is not None and not accept(r):
+                        res.skipped += 1
                         continue
                     if len(res.files) >= max_files:
                         res.truncated = True
