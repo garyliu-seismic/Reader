@@ -104,6 +104,36 @@ def make_record(bid, offset, percent, chapter, device, updated=None) -> dict:
             "device": device}
 
 
+MEDIA_KINDS = ("audio", "comic")
+MAX_POS_MS = 1000 * 3600 * 1000          # 远端值的合理上限：1000 小时 / 20 万页，超出的当作坏数据
+MAX_PAGE = 200000
+
+
+def make_media_record(bid, kind, percent, device, pos_ms=None, page=None, updated=None) -> dict:
+    """应用内媒体（音频 / 漫画）的进度记录。在文字书记录的基础上加可选字段 kind / pos_ms / page，
+    offset 恒为 0、chapter 为空：旧版只认 book_id / offset / percent / updated / device，会无视多出来的字段，
+    而旧版本来就不会为 .mp3 / .zip 拉取进度（它们对旧版是「外部格式」），所以不会被这条记录误导。"""
+    rec = make_record(bid, 0, percent, "", device, updated)
+    rec["kind"] = kind if kind in MEDIA_KINDS else ""
+    if pos_ms is not None:
+        rec["pos_ms"] = int(pos_ms)
+    if page is not None:
+        rec["page"] = int(page)
+    return rec
+
+
+def media_position(rec, kind: str) -> Optional[int]:
+    """远端记录里的媒体位置：audio → pos_ms（毫秒），comic → page（页序号，0 起）。字段缺失 / 类型错 / 越界返回 None
+    （来自服务器的数据不可信：布尔、浮点、负数、超上限都不采信）。"""
+    if not isinstance(rec, dict):
+        return None
+    key, cap = ("pos_ms", MAX_POS_MS) if kind == "audio" else ("page", MAX_PAGE)
+    v = rec.get(key)
+    if isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= cap:
+        return None
+    return v
+
+
 def merge_progress(local: Optional[dict], remote: Optional[dict]) -> Optional[dict]:
     """较新的 updated 获胜；相等时偏向本地。"""
     if not remote:
@@ -189,6 +219,11 @@ class SyncWorker(QObject):
     downloaded = Signal(str)        # 本地路径
     remoteList = Signal(object)     # [(rel, size)]
 
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self._push_lock = threading.Lock()      # 进度推送串行；慢链路上先发的 PUT 不会晚于后发的而盖掉新进度
+        self._push_newest = {}                  # book_id → 已排队的最新 updated
+
     @staticmethod
     def _spawn(fn):
         t = threading.Thread(target=fn, daemon=True)
@@ -214,10 +249,15 @@ class SyncWorker(QObject):
         if not c:
             return None
         user = cfg.get("sync_user_name") or "default"
+        bid, upd = rec.get("book_id"), rec.get("updated", 0)
+        self._push_newest[bid] = max(self._push_newest.get(bid, 0), upd)
 
         def run():
             try:
-                push_progress(c, user, rec)
+                with self._push_lock:
+                    if upd < self._push_newest.get(bid, 0):
+                        return                  # 同一本书已有更新的记录排在后面：这条过时了，不推
+                    push_progress(c, user, rec)
             except Exception as e:
                 _log_net(f"[同步] 上传进度失败: {e}")
                 self.status.emit("同步进度失败（已忽略）")

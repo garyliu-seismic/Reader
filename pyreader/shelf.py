@@ -32,16 +32,22 @@ from .store import is_hidden_name, load_json, normalize_rel, safe_component, sav
 
 WIRE_VERSION = 1
 STATE_VERSION = 1
+MEDIA_PROGRESS_KEYS = ("_progress_ms", "_progress_page", "_progress_pct_")     # bookmarks.json 里应用内媒体的进度字段
 
-# 单一来源：READABLE_EXTS = 阅读器能打开的（load_book 只认这些）；EXTERNAL_EXTS = 只存不读（有声书 / 漫画压缩包），
-# 书架可以列出、扫描、上传、下载，打开时交给系统默认应用，绝不进 load_book 与进度逻辑；BOOK_EXTS = 书架可列的全部。
+# 单一来源：READABLE_EXTS = 阅读器（文字版式）能打开的，只有它们进 load_book / BookLoader；
+# INAPP_MEDIA_EXTS = 应用内播放 / 浏览的媒体（音频 → AudioPlayerView，.zip / .cbz 漫画 → ComicView），有进度但不进 load_book；
+# EXTERNAL_EXTS = 只存不读（没有内置解码器的 .cbr / .rar / .7z），打开时交给系统默认应用，不记进度；
+# MEDIA_EXTS = 以上两类合起来（凡不是文字书的都在里面）；BOOK_EXTS = 书架可列的全部。
 # 必须全小写且带点（endswith 吃元组）；不要放 .exe / .bat / .lnk 等可执行类型。
 READABLE_EXTS = (".txt", ".md", ".markdown", ".epub", ".html", ".htm", ".mobi",
                  ".azw", ".azw3", ".prc", ".pdf", ".docx", ".pptx")
 AUDIO_EXTS = (".mp3", ".m4a", ".m4b", ".aac", ".flac", ".ogg", ".opus", ".wav")
 ARCHIVE_EXTS = (".zip", ".cbz", ".cbr", ".7z", ".rar")
-EXTERNAL_EXTS = AUDIO_EXTS + ARCHIVE_EXTS
-BOOK_EXTS = READABLE_EXTS + EXTERNAL_EXTS
+COMIC_EXTS = (".zip", ".cbz")
+INAPP_MEDIA_EXTS = AUDIO_EXTS + COMIC_EXTS
+EXTERNAL_EXTS = (".cbr", ".7z", ".rar")
+MEDIA_EXTS = INAPP_MEDIA_EXTS + EXTERNAL_EXTS
+BOOK_EXTS = READABLE_EXTS + AUDIO_EXTS + ARCHIVE_EXTS
 
 
 def media_kind(name) -> str:
@@ -52,14 +58,27 @@ def media_kind(name) -> str:
     return "audio" if n.endswith(AUDIO_EXTS) else "archive" if n.endswith(ARCHIVE_EXTS) else "book" if n.endswith(READABLE_EXTS) else ""
 
 
+def inapp_kind(name) -> str:
+    """应用内媒体的类别：audio（AudioPlayerView）| comic（.zip / .cbz，ComicView）| ''（不是应用内媒体）。"""
+    if not isinstance(name, str):
+        return ""
+    n = name.lower()
+    return "audio" if n.endswith(AUDIO_EXTS) else "comic" if n.endswith(COMIC_EXTS) else ""
+
+
 def is_readable(name) -> bool:
     """文件名 / 路径的扩展名是否属于阅读器能打开的格式（不区分大小写）。"""
     return isinstance(name, str) and name.lower().endswith(READABLE_EXTS)
 
 
 def is_external(name) -> bool:
-    """文件名 / 路径的扩展名是否属于「只存不读」格式（有声书 / 漫画压缩包），不区分大小写。"""
+    """文件名 / 路径的扩展名是否属于「只存不读」格式（.cbr / .rar / .7z，没有内置解码器），不区分大小写。"""
     return isinstance(name, str) and name.lower().endswith(EXTERNAL_EXTS)
+
+
+def is_inapp_media(name) -> bool:
+    """文件名 / 路径的扩展名是否属于应用内播放 / 浏览的媒体（音频、.zip / .cbz 漫画），不区分大小写。"""
+    return isinstance(name, str) and name.lower().endswith(INAPP_MEDIA_EXTS)
 
 FUTURE_LIMIT_MS = 24 * 3600 * 1000       # 超过「现在 + 24 小时」的时间戳属于时钟异常
 CLAMPED_TS = 1                           # 时钟异常的 ts 截断成最旧的 1ms（见 _parse_ts 的说明）
@@ -309,13 +328,21 @@ class Book:
 
     @property
     def external(self) -> bool:
-        """只存不读的格式（有声书 / 漫画压缩包）：按真实文件名判断，不单信 fmt（索引缓存里的 fmt 不可信，占位卡 fmt 为空）。"""
+        """只存不读的格式（.cbr / .rar / .7z）：按真实文件名判断，不单信 fmt（索引缓存里的 fmt 不可信，占位卡 fmt 为空）。"""
         if is_external(self.remote_rel) or any(is_external(p) for p in self.local_paths):
             return True
         return bool(self.fmt) and ("." + self.fmt) in EXTERNAL_EXTS
 
     @property
+    def inapp_media(self) -> bool:
+        """应用内播放 / 浏览的媒体（音频、.zip / .cbz 漫画）：有进度，但不是文字书。判断依据同 external。"""
+        if is_inapp_media(self.remote_rel) or any(is_inapp_media(p) for p in self.local_paths):
+            return True
+        return bool(self.fmt) and ("." + self.fmt) in INAPP_MEDIA_EXTS
+
+    @property
     def readable(self) -> bool:
+        """会记进度 / 最近阅读的书（文字书与应用内媒体）；只有外部格式不记。"""
         return not self.external
 
     @property
@@ -493,13 +520,17 @@ def build_books(local_files: Iterable[LocalFile] = (), remote_files=None, overla
                 best = rec
         if best and b.readable:      # 外部格式不记进度（别的设备 / 旧别名里的杂散记录也不采信）
             b.percent, b.progress_updated, b.progress_device = best.get("percent"), best.get("updated", 0.0), best.get("device", "")
-        bm_ts, bm_off = 0.0, 0.0
+        bm_ts, bm_off, bm_frac = 0.0, 0.0, 0.0
         for p in b.local_paths:
             ent = nbm.get(norm_path(p)) if b.readable else None
             if ent:
                 bm_ts = max(bm_ts, _num(ent.get("_progress_ts_"), 0.0))
-                bm_off = max(bm_off, _num(ent.get("_progress_"), 0.0))
+                bm_off = max(bm_off, _num(ent.get("_progress_"), 0.0), _num(ent.get("_progress_ms"), 0.0),
+                             _num(ent.get("_progress_page"), 0.0))
+                bm_frac = max(bm_frac, _num(ent.get("_progress_pct_"), 0.0))
         b.has_progress = bm_off > 0
+        if b.percent is None and bm_frac > 0 and b.inapp_media:      # 应用内媒体：书签里的 0..1 比例兜底（进度摘要 / 索引还没有时）
+            b.percent, b.progress_updated = min(100.0, bm_frac * 100.0), bm_ts
         seed = max([recent_rank.get(norm_path(p), 0.0) for p in b.local_paths] or [0.0])
         b.last_opened = float(opened.get(bid, seed) or 0.0) if b.readable else 0.0     # 外部格式不进「最近阅读」（旧版 recent / 索引里的杂散记录不采信）
         b.last_read = max(b.last_opened, b.progress_updated, bm_ts)
@@ -1231,13 +1262,16 @@ def cover_glyph(title: str) -> str:
 
 
 def bookmark_snapshot(bookmarks) -> Dict[str, dict]:
-    """给后台线程用的书签快照：只取 _progress_ / _progress_ts_（主线程拷贝，之后不再共享可变的 bookmarks）。"""
+    """给后台线程用的书签快照：只取 _progress_ / _progress_ts_ 与媒体进度字段（主线程拷贝，之后不再共享可变的 bookmarks）。"""
     out: Dict[str, dict] = {}
     if not isinstance(bookmarks, dict):
         return out
     for k, v in list(bookmarks.items()):
         if isinstance(k, str) and isinstance(v, dict):
             out[k] = {"_progress_": v.get("_progress_"), "_progress_ts_": v.get("_progress_ts_")}
+            for f in MEDIA_PROGRESS_KEYS:            # 应用内媒体的进度字段（音频毫秒 / 漫画页 / 0..1 比例）
+                if f in v:
+                    out[k][f] = v[f]
     return out
 
 

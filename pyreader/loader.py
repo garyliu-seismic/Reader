@@ -5,7 +5,7 @@ from .pdf import load_pdf, load_kindle
 from .docx import load_docx
 from .pptx import load_pptx
 from .cache import load_cache, save_cache
-from .shelf import EXTERNAL_EXTS
+from .shelf import MEDIA_EXTS
 
 # ============ 后台加载（不阻塞 UI） ============
 class BookLoader(QObject):
@@ -64,7 +64,7 @@ class BookLoader(QObject):
                 text, chapters, title = load_markdown(self.path)
             elif ext == ".kfx":
                 raise RuntimeError("暂不支持 KFX 格式，请先用 Calibre 转换为 EPUB 或 MOBI")
-            elif ext in EXTERNAL_EXTS:       # 保险：有声书 / 漫画压缩包绝不能掉进下面「按文本整个读进内存」的兜底
+            elif ext in MEDIA_EXTS:          # 保险：有声书 / 漫画压缩包绝不能掉进下面「按文本整个读进内存」的兜底（正常由 MainWindow 分发到播放器）
                 raise RuntimeError("阅读器不能打开这种格式（有声书 / 压缩包），请用系统应用打开")
             else:
                 self.progress.emit(5, "读取文件…")
@@ -103,7 +103,7 @@ class BookLoader(QObject):
             elif ext in (".md", ".markdown"):
                 text, _, _ = load_markdown(self.path)
                 return text
-            elif ext in EXTERNAL_EXTS:
+            elif ext in MEDIA_EXTS:
                 return None
             else:
                 with open(self.path, "rb") as f:

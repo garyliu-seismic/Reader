@@ -16,6 +16,10 @@ from .config import (view_count, view_of_page, CONFIG_PATH, BOOKMARKS_PATH, OUTE
                      load_json, save_json, default_cjk_font, THEMES, DEFAULT_THEME, DEFAULT_CONFIG,
                      FLIP_EFFECTS, DEFAULT_FLIP_EFFECT, set_net_proxy)
 from .ttsplayer import TtsPlayer
+from .comicview import ComicView
+from . import mediautil as mu
+if _HAS_MULTIMEDIA:
+    from .audioplayer import AudioPlayerView, audio_available
 from .markdown import md_chapters, MD_HEAD_RE
 from .textio import MD_EXTS
 from .pager import LazyPager
@@ -153,6 +157,23 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
         self.stack.addWidget(self.shelf)                 # 第 0 页：书架
         self.stack.addWidget(self.view)                  # 第 1 页：阅读页
+        # 应用内媒体：第 2 页漫画（.zip / .cbz），第 3 页音频（没有 QtMultimedia 时为 None，打开时交给系统应用）
+        self.comic = ComicView()
+        self.comic.set_theme(THEMES.get(self.cfg.get("theme"), THEMES[DEFAULT_THEME]))
+        self.comic.backRequested.connect(self.show_shelf)
+        self.comic.pageChanged.connect(self._on_comic_page)
+        self.comic.optionsChanged.connect(self._save_comic_options)
+        self.stack.addWidget(self.comic)
+        self.audio = AudioPlayerView() if _HAS_MULTIMEDIA else None
+        if self.audio:
+            self.audio.backRequested.connect(self.show_shelf)
+            self.audio.positionChanged.connect(self._on_audio_position)
+            self.audio.playbackStateChanged.connect(self._on_audio_state)
+            self.audio.seeked.connect(self._on_audio_seeked)
+            self.audio.failed.connect(lambda m: self.statusBar().showMessage("无法播放：" + m, 8000))
+            self.stack.addWidget(self.audio)
+        self._media = None                # 当前打开的应用内媒体（见 _open_media）；None = 没有
+        self._text_active = True          # 阅读页上的书是不是「当前书」：打开媒体后为 False（书架里再点勾选不回到阅读页）
         self.setCentralWidget(self.stack)                # 沉浸阅读：默认全宽
         self._resized_on_shelf = False    # 书架可见期间窗口变过大小 / 书加载完成：回阅读页时要重排
         self._shelf_open_pending = False  # 从书架双击打开：加载失败时回书架
@@ -262,9 +283,9 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("就绪")
         self.resize(1280, 800)
         # 启动页：指定了书 → 阅读页（load_book 会切页）；否则「启动时显示书架」或没有可用的最近阅读 → 书架
-        has_recent = any(isinstance(p, str) and os.path.exists(p) and not shelfmod.is_external(p)
+        has_recent = any(isinstance(p, str) and os.path.exists(p) and shelfmod.is_readable(p)
                          for p in self.cfg.get("recent", []))
-        start_shelf = (not book_path or shelfmod.is_external(book_path)) and (bool(self.cfg.get("shelf_start_in_shelf", False)) or not has_recent)
+        start_shelf = (not book_path or not shelfmod.is_readable(book_path)) and (bool(self.cfg.get("shelf_start_in_shelf", False)) or not has_recent)
         self.stack.setCurrentIndex(0 if start_shelf else 1)
         self._sync_page_state()
         QTimer.singleShot(300, self.shelf.rescan_if_stale)   # 先用 index.json 缓存画界面，稍后后台增量扫描
@@ -363,15 +384,19 @@ class MainWindow(QMainWindow):
     def _shelf_visible(self):
         return self.stack.currentWidget() is self.shelf
 
+    def _reader_visible(self):
+        return self.stack.currentWidget() is self.view
+
     def _sync_page_state(self):
-        """按当前页刷新：书架按钮勾选、依赖阅读页的动作 / 搜索框可用性、窗口标题。"""
+        """按当前页刷新：书架按钮勾选、依赖阅读页的动作 / 搜索框可用性、窗口标题（媒体页同书架：没有文字阅读动作可用）。"""
         on_shelf = self._shelf_visible()
+        on_reader = self._reader_visible()
         self.shelf_act.setChecked(on_shelf)
         for a in self._reader_acts:
-            a.setEnabled(not on_shelf)
+            a.setEnabled(on_reader)
         for w in self._reader_widgets:
-            w.setEnabled(not on_shelf)
-        if not on_shelf:
+            w.setEnabled(on_reader)
+        if on_reader:
             self._update_tts_actions()    # stop_act 的可用性取决于朗读状态，不能一律启用
         title = self.windowTitle()
         if on_shelf:
@@ -384,14 +409,21 @@ class MainWindow(QMainWindow):
     def show_shelf(self):
         if self._shelf_visible():
             return
-        self._save_progress(force=False)  # 离开阅读页前存一次进度：书架上看到的进度是最新的
+        was_media = self._media is not None
+        if was_media:
+            self._close_media()           # 媒体不留在后台：停播并放开文件（云端缓存副本才能被替换 / 删除）
+        else:
+            self._save_progress(force=False)  # 离开阅读页前存一次进度：书架上看到的进度是最新的
         self.stack.setCurrentIndex(0)
+        if was_media:                     # 媒体页的标题不是阅读页的标题：回阅读页时按文字书恢复
+            self.setWindowTitle("书架 — PyReader")
+            self._reader_title = os.path.basename(self.book_path) + " — PyReader" if self.book_path else ""
         self._sync_page_state()
 
     def show_reader(self):
         """切到阅读页。必须发生在启动 loader 之前：pagination_params 用阅读页的 height()，
         QStackedLayout 只给当前页设置几何，隐藏的页尺寸可能是旧的（或从未显示过的默认值）。"""
-        if not self._shelf_visible():
+        if self._reader_visible():
             return
         self.stack.setCurrentIndex(1)
         self._sync_page_state()
@@ -402,7 +434,7 @@ class MainWindow(QMainWindow):
     def _on_shelf_act(self, checked):
         if checked:
             self.show_shelf()
-        elif self.book_path:
+        elif self.book_path and self._text_active:
             self.show_reader()
         else:
             self.shelf_act.setChecked(True)   # 没有可返回的书：留在书架
@@ -413,10 +445,246 @@ class MainWindow(QMainWindow):
             self.shelf.launch_file(path)
             return
         self.load_book(path)
-        self._shelf_open_pending = True
+        self._shelf_open_pending = not shelfmod.is_inapp_media(path)     # 媒体同步打开，失败时 _open_media 自己兜底
+
+    # ---- 应用内媒体（音频 / 漫画）：打开、进度、离开 ----
+    MEDIA_SAVE_S = 5.0        # 本地进度（bookmarks.json / 书架）至多每 5 秒存一次；暂停 / 离开页面 / 退出时立即存
+    MEDIA_PUSH_S = 30.0       # 云端逐书进度至多每 30 秒推一次；30 秒计时器兜底，安静下来前的最后一次也会推出去
+
+    def _media_widget(self, kind):
+        return self.comic if kind == "comic" else self.audio
+
+    def _media_bookmark(self, path):
+        return self.bookmarks.get(path) or shelfmod.bookmark_for(self.bookmarks, path) or {}
+
+    @staticmethod
+    def _int_field(ent, key):
+        v = ent.get(key)
+        return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else 0
+
+    def _open_media(self, path, kind):
+        """音频 / .zip / .cbz 在应用内打开：停朗读、存文字书进度、放开上一个媒体，再切到对应页并从断点继续。
+        打不开（没有音频设备 / 没有 QtMultimedia / 不是漫画的 .zip）时退回系统默认应用，行为同旧版。"""
+        self._tts_stop()
+        self._save_progress(force=False)
+        self._close_media()
+        self._shelf_open_pending = False
+        ent = self._media_bookmark(path)
+        start = self._int_field(ent, "_progress_ms" if kind == "audio" else "_progress_page")
+        if kind == "audio":
+            if self.audio is None:
+                ok, err = False, "没有 QtMultimedia"
+            elif not audio_available():
+                ok, err = False, "没有可用的音频输出设备"
+            else:
+                if "audio_speed" in self.cfg:
+                    self.audio.set_speed(self.cfg["audio_speed"])
+                if "audio_volume" in self.cfg:
+                    self.audio.set_volume(self.cfg["audio_volume"])
+                ok, err = self.audio.open_audio(path, start), "找不到文件"
+        else:
+            self._apply_comic_options()
+            ok = self.comic.open_comic(path, start)
+            err = self.comic.last_error()
+        if not ok:
+            self.statusBar().showMessage(f"无法在应用内打开 {os.path.basename(path)}（{err}），改用系统应用", 8000)
+            if os.path.isfile(path):
+                self.shelf.open_external(path)
+            if self.stack.currentWidget() in (self.comic, self.audio):
+                self.show_shelf()
+            return
+        self.shelf.note_opened(path)
+        self._media = {"path": path, "kind": kind, "bid": syncmod.book_id(path), "start": start, "pos": start, "dur": 0,
+                       "page": start, "count": self.comic.page_count() if kind == "comic" else 0,
+                       "saved_at": None, "pushed_at": None, "dirty": False, "push_due": False,
+                       "closing": False, "touched": False, "applying": False}
+        self._text_active = False
+        self.stack.setCurrentWidget(self._media_widget(kind))
+        self._sync_page_state()
+        self.setWindowTitle(os.path.basename(path) + " — PyReader")
+        self._media_widget(kind).setFocus()
+        self.sync.pull(self.cfg, path)       # 未启用时是 no-op；别的设备读得更远则在没动过之前跳过去
+        self.statusBar().showMessage(os.path.basename(path), 4000)
+
+    def _apply_comic_options(self):
+        self._applying_opts = True
+        try:
+            if self.cfg.get("comic_fit"):
+                self.comic.set_fit_mode(self.cfg["comic_fit"])
+            if "comic_spread" in self.cfg:
+                self.comic.set_spread(bool(self.cfg["comic_spread"]))
+            if "comic_rtl" in self.cfg:
+                self.comic.set_rtl(bool(self.cfg["comic_rtl"]))
+        finally:
+            self._applying_opts = False
+
+    def _save_comic_options(self):
+        if getattr(self, "_applying_opts", False):
+            return
+        self.cfg.update({"comic_fit": self.comic.fit_mode(), "comic_spread": self.comic.spread(), "comic_rtl": self.comic.rtl()})
+        save_json(CONFIG_PATH, self.cfg)
+
+    def _on_audio_position(self, pos, dur):
+        m = self._media
+        if m is None or m["kind"] != "audio":
+            return
+        m["pos"], m["dur"] = pos, dur
+        if m["applying"] or not m["touched"]:     # 载入后自动续播到断点、别的设备的位置：不是本机的阅读事件，不存也不回推（否则会盖上新时间戳，挡住更新的远端进度）
+            return
+        m["dirty"] = True
+        if not m["closing"]:
+            self._save_media_progress(force=False)
+
+    def _on_audio_seeked(self):
+        if self._media is not None and self._media["kind"] == "audio" and not self._media["closing"]:
+            self._media["touched"] = True
+
+    def _on_audio_state(self, playing):
+        m = self._media
+        if m is None or m["kind"] != "audio" or m["closing"]:
+            return
+        if playing:
+            m["touched"] = True
+        elif m["touched"]:
+            self._save_media_progress(force=True, push_gap=self.MEDIA_SAVE_S)     # 暂停：立刻存，云端至多每 5 秒推一次
+
+    def _on_comic_page(self, page, count):
+        m = self._media
+        if m is None or m["kind"] != "comic":
+            return
+        m["page"], m["count"] = page, count
+        if m["applying"]:
+            return
+        m["dirty"] = True
+        m["touched"] = m["touched"] or page != m["start"]
+        if not m["closing"]:
+            self._save_media_progress(force=False)
+
+    def _media_snapshot(self):
+        """当前要记的进度 {"ms"|"page", "frac"（0..1）}；音频位置不值得记（开头 / 缺位置）时返回 None。"""
+        m = self._media
+        if m["kind"] == "audio":
+            pos, dur = m["pos"], m["dur"]
+            if dur > 0 and pos > mu.RESUME_MARGIN_MS and pos >= dur - mu.RESUME_MARGIN_MS:
+                return {"ms": 0, "frac": 1.0}                      # 听完了：下次从头，书架上记 100%
+            if not mu.should_save_resume(pos, dur):
+                return None
+            return {"ms": pos, "frac": min(1.0, pos / dur) if dur > 0 else 0.0}
+        page, count = m["page"], m["count"]
+        last = max(page, self.comic.screen_last(page))      # 跨页时一屏有两页：按这屏的最后一页算，翻到底才是 100%
+        return {"page": page, "frac": min(1.0, last / (count - 1)) if count > 1 else 0.0}
+
+    def _save_media_progress(self, force=True, push_gap=None):
+        """存媒体进度到 bookmarks.json（_progress_ms / _progress_page + 0..1 的 _progress_pct_）并通知书架；
+        force=False 时至多每 MEDIA_SAVE_S 秒一次（没存的留着，下次事件或 30 秒计时器再存）。返回推送线程。"""
+        m = self._media
+        if m is None or not (force or m["dirty"]):
+            return None
+        now = _time.monotonic()
+        if not force and m["saved_at"] is not None and now - m["saved_at"] < self.MEDIA_SAVE_S:
+            return None
+        snap = self._media_snapshot()
+        m["dirty"] = False
+        if snap is None:
+            return None
+        m["saved_at"] = now
+        updated = _time.time()
+        device = self.cfg.get("device_name") or syncmod.default_device_name()
+        ent = self.bookmarks.setdefault(m["path"], {})
+        if m["kind"] == "audio":
+            ent["_progress_ms"] = snap["ms"]
+        else:
+            ent["_progress_page"] = snap["page"]
+        ent["_progress_pct_"] = round(snap["frac"], 6)
+        ent["_progress_ts_"] = updated
+        try:
+            save_json(BOOKMARKS_PATH, self.bookmarks)
+        except Exception:
+            pass
+        self.shelf.note_progress(m["path"], snap["frac"] * 100.0, updated, device)
+        m["rec"] = syncmod.make_media_record(m["bid"], m["kind"], snap["frac"] * 100.0, device,
+                                             pos_ms=snap.get("ms"), page=snap.get("page"), updated=updated)
+        m["push_due"] = True
+        return self._push_media(force=push_gap is None and force, gap=push_gap)
+
+    def _push_media(self, force=False, gap=None):
+        """把最近一次存下的媒体进度推到云端（force 立即；否则至多每 gap 秒，默认 MEDIA_PUSH_S）。"""
+        m = self._media
+        if m is None or not m["push_due"]:
+            return None
+        now = _time.monotonic()
+        gap = 0.0 if force else (self.MEDIA_PUSH_S if gap is None else gap)
+        if m["pushed_at"] is not None and now - m["pushed_at"] < gap:
+            return None
+        m["push_due"], m["pushed_at"] = False, now
+        return self.sync.push(self.cfg, m["rec"])
+
+    def _close_media(self):
+        """离开媒体：存最后的进度并推送，停播 / 关档案放开文件，记住音量 / 倍速。没有打开的媒体是空操作。返回推送线程。"""
+        m = self._media
+        if m is None:
+            return None
+        m["closing"] = True
+        if m["kind"] == "audio":
+            self.audio.close_audio()         # 先让播放器补发最后一次位置，再存
+            t = self._flush_media()
+            vol, spd = self.audio.volume(), self.audio.speed()
+            if (self.cfg.get("audio_volume"), self.cfg.get("audio_speed")) != (vol, spd):
+                self.cfg.update({"audio_volume": vol, "audio_speed": spd})
+                save_json(CONFIG_PATH, self.cfg)
+        else:
+            t = self._flush_media()
+            self.comic.close_comic()
+        self._media = None
+        return t
+
+    def _flush_media(self):
+        """关闭时：有没存的变化才存（只是打开看看不重写时间戳、不回推，免得盖掉别的设备的进度）；已存未推的补推。"""
+        t = self._save_media_progress(force=True) if self._media["dirty"] else None
+        return t or self._push_media(force=True)
+
+    def _apply_remote_media(self, remote):
+        """别的设备记的位置比本机新、而且本机还没动过（没播放 / 没翻页）：跳过去。远端数据不可信，逐项校验。"""
+        m = self._media
+        if not isinstance(remote, dict) or m["closing"] or m["touched"] or remote.get("kind") != m["kind"]:
+            return
+        val = syncmod.media_position(remote, m["kind"])
+        local_ts = shelfmod._num(self._media_bookmark(m["path"]).get("_progress_ts_"), 0.0)
+        rts = shelfmod._num(remote.get("updated"))
+        if val is None or rts is None or rts <= local_ts:
+            return
+        if m["kind"] == "comic":
+            val = min(val, max(0, self.comic.page_count() - 1))      # 远端页码可能超出本机这份压缩包
+        if val != m["start"]:
+            m["applying"] = True
+            try:
+                if m["kind"] == "audio":
+                    self.audio.open_audio(m["path"], val)     # 重开比在载入中途 seek 可靠（见 AudioPlayerView 的续播说明）
+                else:
+                    self.comic.go_to(val)
+            finally:
+                m["applying"] = False
+        m["start"], m["pos"], m["page"] = val, val, val
+        m["touched"] = False
+        ent = self.bookmarks.setdefault(m["path"], {})
+        ent["_progress_ms" if m["kind"] == "audio" else "_progress_page"] = val
+        pct = shelfmod._num(remote.get("percent"), 0.0)
+        ent["_progress_pct_"] = round(min(100.0, max(0.0, pct)) / 100.0, 6)
+        ent["_progress_ts_"] = rts
+        try:
+            save_json(BOOKMARKS_PATH, self.bookmarks)
+        except Exception:
+            pass
+        self.shelf.note_progress(m["path"], pct, rts, str(remote.get("device", ""))[:64], local=False)
+        self.statusBar().showMessage(f"☁️ 已同步进度（来自 {remote.get('device', '?')}，{pct:.1f}%）", 6000)
 
     def _on_progress_tick(self):
-        """30 秒进度计时器：书架可见且阅读位置没变时什么都不做。"""
+        """30 秒进度计时器：媒体页把攒着的本地进度存下并推到云端；书架可见且阅读位置没变时什么都不做。"""
+        if self._media is not None:
+            self._save_media_progress(force=False)
+            self._push_media(force=False)
+        if not self._text_active:
+            return
         if self._shelf_visible() and self.view.left_page_offset() == self._last_saved_offset:
             return
         self._save_progress(force=False)
@@ -550,6 +818,9 @@ class MainWindow(QMainWindow):
             self._save_progress(force=True)
 
     def _on_remote_progress(self, book_path, remote):
+        if self._media is not None and book_path == self._media["path"]:
+            self._apply_remote_media(remote)
+            return
         if remote is None and book_path == self.book_path and self._seed_push == book_path:
             self._seed_remote_none = True        # 远端没有这本书的进度：种入的本地进度要推上去
             self._maybe_push_seed()
@@ -606,14 +877,22 @@ class MainWindow(QMainWindow):
         start = libs[0] if libs and os.path.isdir(libs[0]) else ""
         path, _ = QFileDialog.getOpenFileName(
             self, "打开小说", start,
-            "电子书 (" + " ".join("*" + e for e in shelfmod.READABLE_EXTS) + ");;文本 (*.txt *.md *.markdown);;EPUB (*.epub);;Kindle (*.mobi *.azw *.azw3 *.prc);;网页 (*.html *.htm);;PDF (*.pdf);;Word (*.docx);;PowerPoint (*.pptx)")
+            "全部支持 (" + " ".join("*" + e for e in shelfmod.READABLE_EXTS + shelfmod.INAPP_MEDIA_EXTS) + ");;"
+            "电子书 (" + " ".join("*" + e for e in shelfmod.READABLE_EXTS) + ");;文本 (*.txt *.md *.markdown);;EPUB (*.epub);;Kindle (*.mobi *.azw *.azw3 *.prc);;网页 (*.html *.htm);;PDF (*.pdf);;Word (*.docx);;PowerPoint (*.pptx);;"
+            "有声书 (" + " ".join("*" + e for e in shelfmod.AUDIO_EXTS) + ");;漫画 (" + " ".join("*" + e for e in shelfmod.COMIC_EXTS) + ")")
         if path:
             self.load_book(path)
 
     def load_book(self, path):
-        if shelfmod.is_external(path):       # 有声书 / 漫画压缩包：阅读器读不了，必须在切页、记进度、起 loader 之前拦下
+        kind = shelfmod.inapp_kind(path)
+        if kind:                             # 音频 / .zip / .cbz：应用内播放器 / 漫画页，不进 loader
+            self._open_media(path, kind)
+            return
+        if shelfmod.is_external(path):       # .cbr / .rar / .7z：没有内置解码器，必须在切页、记进度、起 loader 之前拦下
             self.shelf.launch_file(path)
             return
+        self._close_media()                  # 从媒体页转去读文字书：先存断点、放开文件
+        self._text_active = True
         self.show_reader()                   # 先切到阅读页，再启动 loader（几何见 show_reader 的说明）
         self._shelf_open_pending = False
         self.shelf.note_opened(path)
@@ -659,7 +938,7 @@ class MainWindow(QMainWindow):
     def _on_book_loaded(self, text, chapters, title="", extra=None):
         self.load_bar.hide()
         self._shelf_open_pending = False
-        if self._shelf_visible():            # 加载期间用户切回了书架：阅读页尺寸可能是旧的，回来时重排
+        if not self._reader_visible():       # 加载期间用户切回了书架 / 去了媒体页：阅读页尺寸可能是旧的，回来时重排
             self._resized_on_shelf = True
         self.full_text = text
         self.view.set_layout(self._make_layout())
@@ -766,7 +1045,7 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, e):
         super().resizeEvent(e)
         if self.pager:
-            if self._shelf_visible():
+            if not self._reader_visible():
                 self._resized_on_shelf = True   # 隐藏的阅读页拿不到新尺寸：回到阅读页再重排
             else:
                 self._resize_timer.start()      # 200ms 内只重排一次
@@ -1602,7 +1881,7 @@ class MainWindow(QMainWindow):
     def _rebuild_recent_menu(self):
         self.recent_menu.clear()
         for p in self.cfg.get("recent", []):
-            if os.path.exists(p) and not shelfmod.is_external(p):
+            if os.path.exists(p) and shelfmod.is_readable(p):     # 最近打开只列文字书（媒体的断点在书架 / 进度里）
                 self.recent_menu.addAction(os.path.basename(p), lambda p=p: self.load_book(p))
         if self.recent_menu.isEmpty():
             self.recent_menu.addAction("（暂无）").setEnabled(False)
@@ -1639,6 +1918,7 @@ class MainWindow(QMainWindow):
         self.cfg["theme"] = name
         save_json(CONFIG_PATH, self.cfg)
         self.view.set_theme(THEMES.get(name, THEMES[DEFAULT_THEME]))
+        self.comic.set_theme(THEMES.get(name, THEMES[DEFAULT_THEME]))
         self._rebuild_theme_menu()
         self.view.update()
         self.statusBar().showMessage(f"🎨 已切换主题：{name}")
@@ -1676,7 +1956,14 @@ class MainWindow(QMainWindow):
             super().keyPressEvent(e)
             return
         if e.key() == Qt.Key.Key_Escape and not (e.modifiers() & ~Qt.KeyboardModifier.KeypadModifier):
-            self.show_shelf()                # 阅读页 Esc → 书架
+            self.show_shelf()                # 阅读页 / 媒体页 Esc → 书架
+            return
+        if not self._reader_visible():       # 媒体页：翻页 / 播放键由页面自己处理，不能漏给隐藏的阅读页
+            if e.key() in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_PageUp, Qt.Key.Key_PageDown,
+                           Qt.Key.Key_Space, Qt.Key.Key_F3):
+                e.accept()
+                return
+            super().keyPressEvent(e)
             return
         if e.key() == Qt.Key.Key_F and ctrl:
             self.search_box.setFocus(); self.search_box.selectAll(); return
@@ -1698,10 +1985,10 @@ class MainWindow(QMainWindow):
         self.tts_on = False
         if self.player:
             self.player.stop()
-        t = None
-        if self.book_path and self.pager:
+        t = self._close_media()
+        if self.book_path and self.pager and self._text_active:
             if self._loaded_path == self.book_path:
-                t = self._save_progress(force=True)
+                t = self._save_progress(force=True) or t
             else:   # 还在加载中：保持旧行为
                 self.bookmarks.setdefault(self.book_path, {})["_progress_"] = self.view.left_page_offset()
                 save_json(BOOKMARKS_PATH, self.bookmarks)
