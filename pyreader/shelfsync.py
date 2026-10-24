@@ -721,6 +721,48 @@ def upload_book_safe(client: WebDavClient, path: str, folder, name: str, *, max_
         return UploadResult("error", rel, f"上传失败：{e}")
 
 
+# ================================================================== 批量上传计划（纯函数，不碰网络）
+@dataclass
+class BatchPlan:
+    items: List[tuple] = field(default_factory=list)                 # [(本机路径, 云端文件夹, 云端文件名)]
+    total_bytes: int = 0
+    skipped: Dict[str, List[str]] = field(default_factory=dict)      # 跳过原因 -> 文件名（同一原因里按出现顺序）
+
+    def skip(self, why: str, name: str) -> None:
+        self.skipped.setdefault(why, []).append(name)
+
+
+def plan_batch_upload(files: Iterable, cloud_rels: Iterable[str], max_bytes: int, prefix: str = "",
+                      is_cached: Optional[Callable[[str], bool]] = None) -> BatchPlan:
+    """把本机文件（sh.LocalFile）整理成批量上传计划：云端文件夹 = prefix/<书库根下的子文件夹>，保持本地目录结构。
+    跳过：云端已有同名（NFC + 忽略大小写）、云端缓存副本、空文件、超过 max_bytes、名字 / 文件夹不合法、
+    本批里目标重名。绝不会产生覆盖已有文件的条目（upload_book_safe 还会再确认一次）。"""
+    plan = BatchPlan()
+    have = {_nkey(r) for r in cloud_rels}
+    seen: Set[str] = set()
+    for lf in files:
+        if is_cached is not None and is_cached(lf.path):
+            plan.skip("已经是云端缓存副本", lf.name)
+            continue
+        folder = normalize_folder("/".join(x for x in (prefix, lf.sub) if x))
+        rel = upload_rel(folder, lf.name) if folder is not None else None
+        if rel is None:
+            plan.skip("名字或文件夹不合法", lf.name)
+        elif _nkey(rel) in have:
+            plan.skip("云端已有同名文件", lf.name)
+        elif _nkey(rel) in seen:
+            plan.skip("本批里重名", lf.name)
+        elif lf.size <= 0:
+            plan.skip("文件是空的", lf.name)
+        elif lf.size > max_bytes:
+            plan.skip(f"超过单个文件上限（{max_bytes // (1024 * 1024)} MB）", lf.name)
+        else:
+            seen.add(_nkey(rel))
+            plan.items.append((lf.path, folder, lf.name))
+            plan.total_bytes += lf.size
+    return plan
+
+
 @dataclass
 class ProgressResult:
     """一轮进度同步的结果（后台线程 -> 主线程）。"""
