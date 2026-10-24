@@ -469,3 +469,104 @@ def test_suggest_name():
     assert sv.suggest_name("沙丘.epub") == "沙丘 (2).epub"
     assert sv.suggest_name("noext") == "noext (2)"
     assert ss.upload_rel("", sv.suggest_name("沙丘.epub")) is not None
+
+
+# ================================================================== 上传进度 / 状态栏反馈
+class _Src:
+    def __init__(self, data):
+        self.data, self.pos = data, 0
+
+    def read(self, n=-1):
+        n = len(self.data) - self.pos if n is None or n < 0 else n
+        chunk = self.data[self.pos:self.pos + n]
+        self.pos += len(chunk)
+        return chunk
+
+
+def test_progress_reader_counts_throttles_and_always_reports_the_end():
+    calls, t = [], [0.0]
+    r = ss._ProgressReader(_Src(b"x" * 1000), 1000, lambda s, tot: calls.append((s, tot)), clock=lambda: t[0])
+    t[0] = 1.0
+    r.read(100)                                           # 10%：距上次 > 0.3s -> 回调
+    t[0] = 1.1
+    r.read(100)                                           # 20% 但只过了 0.1s -> 节流
+    t[0] = 1.5
+    r.read(100)                                           # 30%，过了 0.4s -> 回调
+    r.read(10_000)                                        # 读完：无视节流，一定回调
+    assert r.read(10) == b""                              # 结束后再读不再回调
+    assert calls == [(100, 1000), (300, 1000), (1000, 1000)]
+
+
+def test_progress_reader_callback_errors_do_not_break_the_upload():
+    def boom(s, t):
+        raise RuntimeError("ui gone")
+    r = ss._ProgressReader(_Src(b"abc"), 3, boom)
+    assert r.read(10) == b"abc"
+
+
+def test_upload_book_safe_reports_monotonic_progress_ending_at_total(server, tmp_path):
+    h, url = server
+    f = mk_file(tmp_path, size=3_000_000)
+    seen = []
+    r = ss.upload_book_safe(WebDavClient(url), f, "小说", "大书.epub", progress=lambda s, t: seen.append((s, t)))
+    assert r.status == "ok" and seen
+    assert all(t == 3_000_000 for _, t in seen)
+    assert [s for s, _ in seen] == sorted(s for s, _ in seen)
+    assert seen[-1] == (3_000_000, 3_000_000)
+    assert h.files["/dav/library/小说/大书.epub"] == open(f, "rb").read()          # 加了包装，内容仍然逐字节一致
+
+
+def test_progress_is_also_reported_on_the_move_fallback_path(server, tmp_path):
+    h, url = server
+    h.move_status = 405
+    f = mk_file(tmp_path, size=1_000_000)
+    seen = []
+    r = ss.upload_book_safe(WebDavClient(url), f, "", "a.epub", progress=lambda s, t: seen.append((s, t)))
+    assert (r.status, r.method) == ("ok", "put")
+    assert seen[-1] == (1_000_000, 1_000_000)
+
+
+def test_worker_emits_upload_progress_with_token(server, tmp_path):
+    h, url = server
+    w = ss.ShelfSyncWorker()
+    prog, done = [], []
+    w.uploadProgress.connect(lambda tok, s, t: prog.append((tok, s, t)))
+    w.uploadDone.connect(lambda tok, res: done.append(res))
+    f = mk_file(tmp_path, size=2_000_000)
+    w.upload({"webdav_enabled": True, "webdav_url": url}, f, "", "a.epub", 42).join(15)
+    assert wait_for(lambda: done and prog and prog[-1][1] == 2_000_000)
+    assert {p[0] for p in prog} == {42} and prog[-1] == (42, 2_000_000, 2_000_000)
+
+
+def test_view_mirrors_upload_status_for_the_main_window(server, tmp_path, rb):
+    h, url = server
+    v = make_view(tmp_path, url)
+    status = []
+    v.uploadStatus.connect(lambda text, ms: status.append((text, ms)))
+    f = mk_file(tmp_path, size=2_000_000)
+    v.upload_chooser = lambda items, folders: ("小说", [(items[0][0], items[0][1])])
+    assert v.start_upload([f]) is True
+    assert wait_for(lambda: len(v.finished) == 1 and v.finished[0].status == "ok")
+    assert wait_for(lambda: status and "已上传" in status[-1][0])
+    assert status[0] == ("正在上传：沙丘.epub", 0)                               # 一开始就有反馈，且常驻
+    assert any("%" in t and "MB" in t and ms == 0 for t, ms in status)         # 中途带百分比 / MB
+    assert status[-1][1] == 15000                                             # 结果提示会自己消失
+    assert "已上传" in v._notice
+
+
+def test_view_ignores_late_progress_from_a_finished_upload(server, tmp_path, rb):
+    h, url = server
+    v = make_view(tmp_path, url)
+    status = []
+    v.uploadStatus.connect(lambda text, ms: status.append((text, ms)))
+    v._on_upload_progress(99, 50, 100)                                         # 没有进行中的上传
+    assert status == [] and "99" not in v._notice
+
+
+def test_view_upload_status_for_guard_failures(server, tmp_path, rb):
+    h, url = server
+    v0 = make_view(tmp_path, None)
+    status = []
+    v0.uploadStatus.connect(lambda text, ms: status.append((text, ms)))
+    assert v0.start_upload([mk_file(tmp_path)]) is False
+    assert status == [("未启用云同步，无法上传", 8000)]

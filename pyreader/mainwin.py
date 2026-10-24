@@ -149,6 +149,7 @@ class MainWindow(QMainWindow):
                                read_only=self._shelf_lock is None)
         self.shelf.openRequested.connect(self._open_from_shelf)
         self.shelf.addLibraryRequested.connect(self._add_library_dir)
+        self.shelf.uploadStatus.connect(lambda text, ms: self.statusBar().showMessage(text, ms))
         self.stack = QStackedWidget()
         self.stack.addWidget(self.shelf)                 # 第 0 页：书架
         self.stack.addWidget(self.view)                  # 第 1 页：阅读页

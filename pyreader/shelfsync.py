@@ -574,6 +574,30 @@ class UploadResult:
     method: str = ""             # ok 时：move（.part 改名）| put（服务器不支持 MOVE，退化为直接 PUT）
 
 
+class _ProgressReader:
+    """包一层只读文件对象：每读一块就累计字节数并回调 progress(sent, total)。
+    回调节流：百分比变化或距上次回调超过 0.3 秒才触发，读完（sent == total）一定触发一次；回调抛错不影响上传。"""
+
+    def __init__(self, fh, total: int, progress: Callable[[int, int], None], clock=time.monotonic):
+        self._fh, self._total, self._cb, self._clock = fh, int(total), progress, clock
+        self._sent = 0
+        self._last_pct = -1
+        self._last_t = 0.0
+
+    def read(self, n: int = -1):
+        data = self._fh.read(n)
+        self._sent += len(data)
+        pct = self._sent * 100 // self._total if self._total > 0 else 100
+        now = self._clock()
+        if pct != self._last_pct and (now - self._last_t >= 0.3 or self._sent >= self._total):
+            self._last_pct, self._last_t = pct, now
+            try:
+                self._cb(self._sent, self._total)
+            except Exception:
+                pass
+        return data
+
+
 def normalize_folder(folder) -> Optional[str]:
     """上传目标文件夹：'' = library 根（未分类）；否则 / 分隔、每段过 safe_segment 且不以 . 或 ~$ 开头，最多 8 层。
     返回规范化后的字符串，不合法返回 None。"""
@@ -616,7 +640,8 @@ def _clear_part(client: WebDavClient, part: str) -> None:
 
 
 def upload_book_safe(client: WebDavClient, path: str, folder, name: str, *, max_bytes: int = MAX_BOOK_BYTES,
-                     now: Optional[float] = None) -> UploadResult:
+                     now: Optional[float] = None,
+                     progress: Optional[Callable[[int, int], None]] = None) -> UploadResult:
     """把本机文件 path 手动上传为 library/<folder>/<name>。阻塞，只能在后台线程用；永远不会静默覆盖已有文件。
 
     1. 目标（NFC + 忽略大小写比较）已存在 -> exists（不上传，调用方提示用户改名）。
@@ -626,6 +651,7 @@ def upload_book_safe(client: WebDavClient, path: str, folder, name: str, *, max_
     4. MOVE（Overwrite: F）改成最终名；目标已存在（412）-> exists。服务器不支持 MOVE 时退化为：直接 PUT 目标
        （带 If-None-Match: *，不支持则只能事后校验），再把 .part 清空（不暴露 DELETE）。
     5. 事后核对最终文件大小。
+    progress(sent, total)：上传字节进度回调（在调用线程里触发；退化为直接 PUT 时从 0 重新计）。
     所有网络 / 服务器错误都以 UploadResult(error) 返回，不外抛。"""
     now = time.time() if now is None else now
     rel = upload_rel(folder, name)
@@ -657,7 +683,7 @@ def upload_book_safe(client: WebDavClient, path: str, folder, name: str, *, max_
         elif not (old.size == 0 or (old.mtime and now - old.mtime > STALE_PART_SECONDS)):
             return busy
         with open(path, "rb") as fh:
-            r = client.put_file(part, fh, size, hdrs, ok_codes=(412,))
+            r = client.put_file(part, _ProgressReader(fh, size, progress) if progress else fh, size, hdrs, ok_codes=(412,))
         if r.status == 412:
             return busy
         ents = {e.name: e for e in client.propfind(ldir, 1)}
@@ -679,7 +705,8 @@ def upload_book_safe(client: WebDavClient, path: str, folder, name: str, *, max_
                 raise
             method = "put"                                # 服务器不支持 MOVE：退化为直接 PUT 目标
             with open(path, "rb") as fh:
-                r = client.put_file(target, fh, size, {"If-None-Match": "*"}, ok_codes=(412,))
+                r = client.put_file(target, _ProgressReader(fh, size, progress) if progress else fh, size,
+                                    {"If-None-Match": "*"}, ok_codes=(412,))
             _clear_part(client, part)
             if r.status == 412:
                 return exists
@@ -719,6 +746,7 @@ class ShelfSyncWorker(QObject):
     pushed = Signal(int, str, str, object)   # (rev, 内容哈希, etag, 读回校验后的戳 dict)：设备文件已推送（读回比对通过）
     pushFailed = Signal(str)
     uploadDone = Signal(object, object)  # (token, UploadResult)
+    uploadProgress = Signal(object, int, int)   # (token, 已发送字节, 总字节)：上传中，已节流
 
     def __init__(self, parent=None, client_factory: Callable[[dict], Optional[WebDavClient]] = client_from_cfg):
         super().__init__(parent)
@@ -950,9 +978,12 @@ class ShelfSyncWorker(QObject):
             mb = 0
         max_bytes = mb * MB if mb > 0 else MAX_BOOK_BYTES
 
+        def report(sent, total):
+            self.uploadProgress.emit(token, sent, total)
+
         def run():
             try:
-                res = upload_book_safe(client, path, folder, name, max_bytes=max_bytes)
+                res = upload_book_safe(client, path, folder, name, max_bytes=max_bytes, progress=report)
             except Exception as e:
                 _log_net(f"[书架] 上传异常 {name}: {e}")
                 res = UploadResult("error", name, f"上传失败：{str(e)[:120]}")

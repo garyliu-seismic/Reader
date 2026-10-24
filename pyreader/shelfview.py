@@ -483,6 +483,7 @@ class ShelfView(QWidget):
     cloudSynced = Signal(int)            # 一轮云端列表已并入书架（参数：云端书数）；测试 / 状态用
     progressSynced = Signal(int)         # 一轮进度同步已并入（参数：得到的进度条数）；测试 / 状态用
     uploadFinished = Signal(object)      # 一次上传结束（shelfsync.UploadResult）
+    uploadStatus = Signal(str, int)      # 上传状态文字 + 显示毫秒数（0 = 一直显示）：主窗口状态栏用，阅读页也看得到
 
     STALE_SECONDS = 60                   # 书架显示时，距上次扫描超过这个秒数才重新扫描
     INDEX_SAVE_MS = 5000                 # index.json 防抖
@@ -520,6 +521,7 @@ class ShelfView(QWidget):
         self._cloud.pushed.connect(self._on_pushed, Qt.ConnectionType.QueuedConnection)   # (rev, hash, etag, 戳)
         self._cloud.pushFailed.connect(self._on_push_failed, Qt.ConnectionType.QueuedConnection)
         self._cloud.uploadDone.connect(self._on_upload_done, Qt.ConnectionType.QueuedConnection)
+        self._cloud.uploadProgress.connect(self._on_upload_progress, Qt.ConnectionType.QueuedConnection)
         # ---- 阶段 4：进度摘要 / 推送 / 上传。下面三个可调用对象供测试替换（默认弹真实对话框）
         self.confirm_push: Callable[[], Optional[bool]] = self._default_confirm_push     # True 同意 / False 拒绝 / None 现在不问
         self.upload_chooser: Callable = self._default_upload_chooser                     # (items, folders) -> (folder, [(path, name)]) | None
@@ -1732,6 +1734,7 @@ class ShelfView(QWidget):
         if not self.cloud_enabled():
             self._notice = "未启用云同步，无法上传"
             self._update_status()
+            self.uploadStatus.emit(self._notice, 8000)
             return False
         from . import sync as syncmod
         items, skipped = [], []
@@ -1748,6 +1751,7 @@ class ShelfView(QWidget):
         if not items:
             self._notice = "没有可上传的文件：" + "；".join(skipped) if skipped else "没有可上传的文件"
             self._update_status()
+            self.uploadStatus.emit(self._notice, 8000)
             return False
         choice = self.upload_chooser(items, self._cloud_folders())
         if not choice:
@@ -1770,10 +1774,22 @@ class ShelfView(QWidget):
         self._upload_cur = (tok, path, folder, name)
         self._notice = f"正在上传：{name}"
         self._update_status()
+        self.uploadStatus.emit(self._notice, 0)
         if self._cloud.upload(self._cfg(), path, folder, name, tok) is None:
             self._upload_cur = None
             self._notice = "未启用云同步，无法上传"
             self._update_status()
+            self.uploadStatus.emit(self._notice, 8000)
+
+    def _on_upload_progress(self, tok, sent, total):
+        cur = self._upload_cur
+        if cur is None or cur[0] != tok or total <= 0:
+            return                                     # 迟到的进度（该次上传已结束）直接丢弃
+        mb = 1024 * 1024
+        queued = f"（队列里还有 {len(self._upload_queue)} 本）" if self._upload_queue else ""
+        self._notice = f"正在上传：{cur[3]} {min(100, sent * 100 // total)}%（{sent / mb:.1f}/{total / mb:.1f} MB）{queued}"
+        self._update_status()
+        self.uploadStatus.emit(self._notice, 0)
 
     def _on_upload_done(self, tok, res):
         cur = self._upload_cur
@@ -1794,6 +1810,7 @@ class ShelfView(QWidget):
         else:
             self._notice = res.message or "上传失败"
         self._update_status()
+        self.uploadStatus.emit(self._notice, 0 if self._upload_queue else 15000)   # 队列里还有书：马上被下一条「正在上传」盖掉
         self.uploadFinished.emit(res)
         self._pump_uploads()
 
