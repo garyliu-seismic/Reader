@@ -325,6 +325,31 @@ def test_failed_mkcol_is_not_cached(server):
     assert "/dav/a/b" in h.dirs
 
 
+def test_mkcol_403_on_existing_dir_is_treated_as_exists(server):
+    """SFTPGo 对虚拟目录挂载点（如 /library）的 MKCOL 回 403：目录确实在 -> 视为已存在，上传才能继续。"""
+    h, url = server
+    h.dirs.add("/dav/library")
+    h.mkcol_existing_status = 403
+    c = WebDavClient(url)
+    assert c.mkcol("library") is False
+    c.mkdirs("library")                                          # 已记入缓存，不再发请求
+    n = len(h.log)
+    c.mkdirs("library")
+    assert len(h.log) == n
+
+
+def test_mkcol_403_on_missing_dir_still_raises(server):
+    """403 且目录并不存在：是真的权限问题，必须报错，不能当成已存在。"""
+    h, url = server
+    h.mkcol_forbidden.add("/dav/nope")
+    c = WebDavClient(url)
+    with pytest.raises(WebDavError) as ei:
+        c.mkcol("nope")
+    assert ei.value.status == 403
+    with pytest.raises(WebDavError):
+        c.mkdirs("nope")                                         # 失败不进缓存，下次仍会再试
+
+
 # ---------------- 重定向不泄露凭据 ----------------
 def _two_servers(auth="bob:secret"):
     s1, h1, u1 = fakedav.start(auth)

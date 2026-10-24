@@ -323,8 +323,14 @@ class WebDavClient:
                                 ok_codes=ok_codes)
 
     def mkcol(self, path: str) -> bool:
-        """创建单层目录；已存在（405）视为成功（返回 False 表示原本就在）。"""
-        st, _ = self._request("MKCOL", path, ok_codes=(405,))
+        """创建单层目录；已存在（405）视为成功（返回 False 表示原本就在）。
+        部分服务器（SFTPGo 的虚拟目录挂载点）对已存在的目录回 403 而不是 405：此时用 PROPFIND 确认，
+        目录确实在就当「已存在」，不在才把 403 当真抛出（不掩盖真正的权限问题）。"""
+        st, _ = self._request("MKCOL", path, ok_codes=(403, 405))
+        if st == 403:
+            if not self.exists(path):
+                raise WebDavError(f"MKCOL {path!r}: 403 Forbidden", status=403)
+            st = 405
         self._remember_dir(path)
         return st != 405
 
