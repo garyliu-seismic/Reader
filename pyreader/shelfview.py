@@ -21,7 +21,7 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 from PySide6.QtCore import (QAbstractTableModel, QCoreApplication, QModelIndex, QObject, QRect, QSize, Qt, QTimer, QUrl,
                             Signal)
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontMetrics, QGuiApplication, QPainter, QPen
-from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QHBoxLayout, QHeaderView,
+from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QHBoxLayout, QHeaderView,
                                QInputDialog, QLabel, QLineEdit, QListView, QListWidget, QListWidgetItem, QMenu,
                                QMessageBox, QPlainTextEdit, QPushButton, QStackedWidget, QStyle, QStyledItemDelegate, QToolButton,
                                QTreeView, QVBoxLayout, QWidget)
@@ -91,6 +91,8 @@ def fmt_ago(ts: float, now: Optional[float] = None) -> str:
 
 def progress_text(b: sh.Book) -> str:
     """进度列 / 卡片上的进度文字：已知百分比 → 'NN%'（读完 → 已读完）；只知道有本地进度偏移 → 在读。"""
+    if b.external:                       # 有声书 / 漫画压缩包：不读、不记进度，进度列留空
+        return ""
     if b.percent is not None:
         if b.status == "done":
             return "已读完"
@@ -262,7 +264,7 @@ class BookModel(QAbstractTableModel):
             if c == 0:
                 return b.title
             if c == 1:
-                return b.fmt.upper()
+                return b.fmt_label
             if c == 2:
                 return progress_text(b)
             if c == 3:
@@ -343,7 +345,21 @@ class BookDelegate(QStyledItemDelegate):
                 p.setPen(Qt.PenStyle.NoPen)
                 p.setBrush(QColor("#ff8c1a"))
                 p.drawEllipse(QRect(x, cover.top() + 8, 9, 9))
-        if b.percent is not None:                         # 封面底部的进度条
+        if b.external:                                    # 外部格式（有声书 / 漫画压缩包）：封面左下角标格式，不画进度条
+            ef = QFont(option.font)
+            ef.setBold(True)
+            ef.setPixelSize(11)
+            efm = QFontMetrics(ef)
+            et = b.fmt_label[:6]
+            if et:                                        # 占位卡 fmt 为空时回退到文件名扩展名；仍为空就不画空药丸
+                epill = QRect(cover.left() + 12, cover.bottom() - 22, efm.horizontalAdvance(et) + 10, efm.height() + 2)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor(0, 0, 0, 120))
+                p.drawRoundedRect(epill, 4, 4)
+                p.setFont(ef)
+                p.setPen(QColor("#ffffff"))
+                p.drawText(epill, int(Qt.AlignmentFlag.AlignCenter), et)
+        elif b.percent is not None:                       # 封面底部的进度条
             track = QRect(cover.left() + 12, cover.bottom() - 10, cover.width() - 20, 4)
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QColor(0, 0, 0, 90))
@@ -459,7 +475,7 @@ class UploadDialog(QDialog):
             return "文件夹名不合法（不能含 \\ : 等字符，不能以 . 开头）"
         for n in self.names():
             if ss.upload_rel(self.folder(), n) is None:
-                return f"文件名不合法或不是支持的电子书格式：{n}"
+                return f"文件名不合法或不是支持的电子书 / 有声书 / 漫画压缩包格式：{n}"
         if len({n.casefold() for n in self.names()}) != len(self.names()):
             return "有重名的文件"
         return ""
@@ -476,20 +492,53 @@ class UploadDialog(QDialog):
 
 
 class BatchUploadDialog(QDialog):
-    """批量上传前的确认对话框：显示数量 / 总大小 / 跳过明细，可给云端文件夹加一个统一前缀。
-    result_value()：前缀（'' = 直接用本地目录结构）；前缀不合法时「开始上传」不可用。"""
+    """批量上传前的确认对话框：按类别（电子书 / 有声书 / 压缩包·漫画）汇总数量和大小，类别可勾选——电子书默认选中，
+    音频和压缩包默认不选（书库目录里常有不相干的音乐 / 备份压缩包，云端又没有删除入口）；外部格式列出清单；
+    显示跳过明细，可给云端文件夹加一个统一前缀。
+    result_value()：前缀（'' = 直接用本地目录结构）；selected_kinds()：勾选的类别；前缀不合法或什么都没选时「开始上传」不可用。"""
+
+    KIND_LABELS = (("book", "电子书"), ("audio", "有声书 / 音频"), ("archive", "压缩包 / 漫画"))
+    LIST_MAX = 200
 
     def __init__(self, plan: "ss.BatchPlan", parent=None):
         super().__init__(parent)
         self.setWindowTitle("批量上传到云端书库")
-        self.resize(560, 420)
+        self.resize(560, 480)
         lay = QVBoxLayout(self)
-        head = QLabel(f"将上传 {len(plan.items)} 本书，共 {fmt_size(plan.total_bytes)}。\n"
-                      "云端文件夹沿用本地书库的子文件夹结构；云端已有同名文件的自动跳过，不会覆盖；"
-                      "失败的书最后集中列出，之后可以再点一次，只会补传没传上的。")
-        head.setTextFormat(Qt.TextFormat.PlainText)
-        head.setWordWrap(True)
-        lay.addWidget(head)
+        self._stats: Dict[str, List[int]] = {}                        # 类别 -> [个数, 字节]
+        listed: List[str] = []
+        for path, folder, name in plan.items:
+            try:
+                sz = os.path.getsize(path)
+            except OSError:
+                sz = 0
+            k = sh.media_kind(name) or "book"
+            st = self._stats.setdefault(k, [0, 0])
+            st[0] += 1
+            st[1] += sz
+            if k != "book":
+                listed.append(f"{folder + '/' if folder else ''}{name}（{fmt_size(sz)}）")
+        self.head = QLabel()
+        self.head.setTextFormat(Qt.TextFormat.PlainText)
+        self.head.setWordWrap(True)
+        lay.addWidget(self.head)
+        self.kind_boxes: Dict[str, QCheckBox] = {}
+        for k, label in self.KIND_LABELS:
+            if k not in self._stats:
+                continue
+            n, sz = self._stats[k]
+            cb = QCheckBox(f"{label}：{n} 个，{fmt_size(sz)}" + ("" if k == "book" else "（默认不选，勾选后才会上传）"))
+            cb.setChecked(k == "book")
+            cb.toggled.connect(lambda _c: self._validate())
+            self.kind_boxes[k] = cb
+            lay.addWidget(cb)
+        if listed:
+            lay.addWidget(QLabel("音频 / 压缩包清单（勾选对应类别才会上传）："))
+            lst = QPlainTextEdit()
+            lst.setReadOnly(True)
+            lst.setPlainText("\n".join(listed[:self.LIST_MAX]) +
+                             (f"\n…… 还有 {len(listed) - self.LIST_MAX} 个" if len(listed) > self.LIST_MAX else ""))
+            lay.addWidget(lst, 1)
         nskip = sum(len(v) for v in plan.skipped.values())
         if nskip:
             lay.addWidget(QLabel(f"已自动跳过 {nskip} 个文件："))
@@ -516,10 +565,19 @@ class BatchUploadDialog(QDialog):
         lay.addWidget(self.buttons)
         self._validate()
 
+    def selected_kinds(self) -> Set[str]:
+        return {k for k, cb in self.kind_boxes.items() if cb.isChecked()}
+
     def _validate(self):
         bad = ss.normalize_folder(self.prefix.text()) is None
-        self.error.setText("前缀文件夹名不合法（不能含 \\ : 等字符，不能以 . 开头）" if bad else "")
-        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(not bad)
+        kinds = self.selected_kinds()
+        n = sum(self._stats[k][0] for k in kinds)
+        sz = sum(self._stats[k][1] for k in kinds)
+        self.head.setText(f"将上传 {n} 个文件，共 {fmt_size(sz)}。\n"
+                          "云端文件夹沿用本地书库的子文件夹结构；云端已有同名文件的自动跳过，不会覆盖；"
+                          "失败的会最后集中列出，之后可以再点一次，只会补传没传上的。")
+        self.error.setText("前缀文件夹名不合法（不能含 \\ : 等字符，不能以 . 开头）" if bad else ("请至少勾选一个类别" if not n else ""))
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(not bad and n > 0)
 
     def result_value(self) -> Optional[str]:
         return ss.normalize_folder(self.prefix.text())
@@ -561,11 +619,15 @@ class ShelfView(QWidget):
         self._notice = ""                             # 一次性提示（如「找不到文件」），下一轮扫描完成后清除
         self._index_dirty = False
         # ---- 云端（阶段 3）
+        if not self._read_only:                       # 清掉上次异常退出留下的下载残片（只读实例不碰：另一个进程可能正在下载）
+            from . import sync as _syncmod
+            _syncmod.sweep_stale_parts()
         self._cloud = cloud or ss.ShelfSyncWorker(self)
         self._cloud.listed.connect(self._on_cloud_listed, Qt.ConnectionType.QueuedConnection)
         self._cloud.listFailed.connect(self._on_cloud_failed, Qt.ConnectionType.QueuedConnection)
         self._cloud.downloadedFor.connect(self._on_downloaded_for, Qt.ConnectionType.QueuedConnection)
         self._cloud.downloadFailed.connect(self._on_download_failed, Qt.ConnectionType.QueuedConnection)
+        self._cloud.downloadProgress.connect(self._on_download_progress, Qt.ConnectionType.QueuedConnection)
         self._cloud.progressPulled.connect(self._on_progress_pulled, Qt.ConnectionType.QueuedConnection)
         self._cloud.progressFailed.connect(self._on_progress_failed, Qt.ConnectionType.QueuedConnection)
         self._cloud.pushed.connect(self._on_pushed, Qt.ConnectionType.QueuedConnection)   # (rev, hash, etag, 戳)
@@ -575,6 +637,7 @@ class ShelfView(QWidget):
         # ---- 阶段 4：进度摘要 / 推送 / 上传。下面三个可调用对象供测试替换（默认弹真实对话框）
         self.confirm_push: Callable[[], Optional[bool]] = self._default_confirm_push     # True 同意 / False 拒绝 / None 现在不问
         self.upload_chooser: Callable = self._default_upload_chooser                     # (items, folders) -> (folder, [(path, name)]) | None
+        self.external_opener: Callable[[str], bool] = self._default_external_opener      # (路径) -> 是否交给了系统应用（测试替换，避免真启动程序）
         self.rename_chooser: Callable = self._default_rename_chooser                     # (name, folder, message) -> 新文件名 | None
         self.run_menu: Callable = lambda menu, global_pos: menu.exec(global_pos)         # 右键菜单怎么弹出（测试替换成直接选动作）
         self.batch_chooser: Callable = self._default_batch_chooser                       # (plan) -> 前缀文件夹 str | None（取消）
@@ -1269,6 +1332,13 @@ class ShelfView(QWidget):
             self._notice = f"云端已移除，无法下载：{b.title}" if b.removed else f"这本书不在云端：{b.title}"
             self._update_status()
             return False
+        from . import sync as syncmod
+        lim = syncmod.max_book_bytes(cfg)
+        if b.size > lim:                              # 先在本地拦下：别发请求再拿一条以字节计的 WebDavError
+            self._notice = f"{b.title}（{fmt_size(b.size)}）{ss.limit_text(lim)}"
+            self._update_status()
+            self.uploadStatus.emit(self._notice, 8000)
+            return False
         self._dl_seq += 1
         tok = self._dl_seq
         self._dl[tok] = (b.id, b.remote_rel, bool(open_when_done))
@@ -1280,18 +1350,52 @@ class ShelfView(QWidget):
         self._cloud.download(cfg, b.remote_rel, b.size, open_when_done, tok)
         return True
 
+    def _on_download_progress(self, tok, done, total):
+        ent = self._dl.get(tok)
+        if ent is None or total <= 0:
+            return                                # 迟到的进度（该次下载已结束）直接丢弃
+        b = self._books.get(ent[0])
+        name = b.title if b is not None else ent[1].rsplit("/", 1)[-1]
+        mb = 1024 * 1024
+        self._notice = f"正在下载：{name} {min(100, done * 100 // total)}%（{done / mb:.1f}/{total / mb:.1f} MB）"
+        self._update_status()
+
     def _on_downloaded_for(self, tok, path: str):
         ent = self._dl.pop(tok, None)
         if ent is None:
             return                                # 不是本视图发起的请求
         self.model.set_busy({v[0] for v in self._dl.values()})
-        want = ent[2] and tok == self._open_token
+        ext = sh.is_external(path)
+        # 外部格式交给系统应用：不切页、不抢阅读窗口，所以不要求「仍是最新意图 / 书架在前台」——GB 级文件下几分钟，
+        # 用户多半已经切走，不能下完了什么都不发生。可读格式仍只让最新的请求打开（别劫持当前窗口）。
+        want = ent[2] and (ext or tok == self._open_token)
         if tok == self._open_token:
             self._open_token = None
         self._notice = ""
         self.rescan(force=True)                   # 新文件落地：重新归并（仅云端 → 已下载）
-        if want and self.isVisible() and os.path.isfile(path):
+        if want and (ext or self.isVisible()) and os.path.isfile(path):
+            self.launch_file(path)
+        elif ent[2]:                              # 想打开但没打开（过期 / 不在前台）：告诉用户文件已经在本机
+            self.uploadStatus.emit(f"已下载：{os.path.basename(path)}（在书架里双击打开）", 8000)
+
+    def _default_external_opener(self, path: str) -> bool:
+        return bool(QDesktopServices.openUrl(QUrl.fromLocalFile(path)))
+
+    def launch_file(self, path: str) -> bool:
+        """打开一个本地文件的唯一出口：阅读器能读的发 openRequested（MainWindow 再 load_book）；
+        外部格式（有声书 / 漫画压缩包）交给系统默认应用，不切页、不 note_opened、不记进度。
+        系统应用只启动 EXTERNAL_EXTS 内的扩展名：这里不能变成任意文件启动器。"""
+        if not sh.is_external(path):
             self.openRequested.emit(path)
+            return True
+        name = os.path.basename(path)
+        try:
+            ok = bool(self.external_opener(path))
+        except Exception:
+            ok = False
+        self._notice = "" if ok else f"系统里没有能打开 {os.path.splitext(name)[1]} 的应用，文件在：{path}"
+        self._update_status()
+        return ok
 
     def _on_download_failed(self, tok, msg: str):
         ent = self._dl.pop(tok, None)
@@ -1315,6 +1419,8 @@ class ShelfView(QWidget):
     def note_opened(self, path: str, ts: Optional[float] = None):
         """阅读页打开了一本书：记 last_opened（只存本机索引，不创建覆盖层条目）。"""
         self._open_token = None                   # 用户已经打开了别的书：还没完成的「下载后打开」不得再抢窗口
+        if sh.is_external(path):
+            return                                # 外部格式不进 recent / 索引（正常路径到不了这里，防御）
         bid = self._book_id(path)
         if not bid or not sh.valid_book_id(bid):
             return
@@ -1331,6 +1437,8 @@ class ShelfView(QWidget):
         """阅读页保存了进度：记百分比（书签里只有字符偏移，没有百分比；已读完 / 进度条靠这条）。
         local=True（默认）：这是本设备上的阅读事件，同时写进本设备设备文件的进度摘要（启用云同步时）；
         local=False：只是把别的设备的进度应用到本机，不当作本设备读过的记录写进摘要。"""
+        if sh.is_external(path):
+            return                                # 外部格式不记进度（防御）
         bid = self._book_id(path)
         if not bid or not sh.valid_book_id(bid):
             return
@@ -1664,7 +1772,7 @@ class ShelfView(QWidget):
         """还没有任何进度信息的书（不在任何设备摘要里）：先试最近读过的，再按书名；其它设备的占位 / 已移除且无副本的不探测。"""
         out = []
         for b in sorted(self._books.values(), key=lambda b: (-b.last_read, b.title.casefold(), b.id)):
-            if b.percent is None and not b.placeholder and not (b.removed and not b.local_paths) and sh.valid_book_id(b.id):
+            if b.percent is None and b.readable and not b.placeholder and not (b.removed and not b.local_paths) and sh.valid_book_id(b.id):
                 out.append(b.id)
         return out
 
@@ -1787,7 +1895,7 @@ class ShelfView(QWidget):
                 return None
             if ss.upload_rel(folder, text) is not None:
                 return text
-            QMessageBox.warning(self, "文件名不合法", "文件名不合法或不是支持的电子书格式，请重新输入。")
+            QMessageBox.warning(self, "文件名不合法", "文件名不合法或不是支持的电子书 / 有声书 / 漫画压缩包格式，请重新输入。")
 
     def start_upload(self, paths) -> bool:
         """上传本机的书到云端书库（弹确认对话框 -> 选文件夹 / 改名 -> 后台上传）。绝不自动调用、绝不覆盖云端已有文件。
@@ -1811,7 +1919,9 @@ class ShelfView(QWidget):
             if syncmod._remote_rel(p) is not None:
                 skipped.append(f"{name}（已经在云端）")
             elif ss.upload_rel("", name) is None:
-                skipped.append(f"{name}（不是支持的电子书格式或文件名不合法）")
+                skipped.append(f"{name}（不是支持的电子书 / 有声书 / 漫画压缩包格式或文件名不合法）")
+            elif os.path.getsize(p) > syncmod.max_book_bytes(self._cfg()):
+                skipped.append(f"{name}（{fmt_size(os.path.getsize(p))}，{ss.limit_text(syncmod.max_book_bytes(self._cfg()))}）")
             else:
                 items.append((p, name))
         if not items:
@@ -1897,7 +2007,8 @@ class ShelfView(QWidget):
         dlg = BatchUploadDialog(plan, self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return None
-        return dlg.result_value()
+        prefix = dlg.result_value()
+        return None if prefix is None else (prefix, dlg.selected_kinds())     # 带上勾选的类别；测试里的假 chooser 只返回前缀字符串也行
 
     def _default_batch_reporter(self, summary: str, failed: List[str]):
         box = QMessageBox(QMessageBox.Icon.Warning if failed else QMessageBox.Icon.Information, "批量上传结束", summary, parent=self)
@@ -1935,11 +2046,14 @@ class ShelfView(QWidget):
             self._update_status()
             self.uploadStatus.emit(self._notice, 8000)
             return False
-        prefix = self.batch_chooser(plan)
-        if prefix is None:
+        choice = self.batch_chooser(plan)
+        if choice is None:
             return False
-        if prefix:
-            plan = ss.plan_batch_upload(files, cloud_rels, max_bytes, prefix, is_cached)   # 前缀变了，「云端已有」要按新位置重算
+        prefix, kinds = choice if isinstance(choice, tuple) else (choice, None)          # kinds None = 不限类别
+        if kinds is not None:
+            files = [lf for lf in files if (sh.media_kind(lf.name) or "book") in kinds]
+        if prefix or kinds is not None:
+            plan = ss.plan_batch_upload(files, cloud_rels, max_bytes, prefix, is_cached)   # 前缀 / 类别变了，计划要重算（「云端已有」按新位置）
             if not plan.items:
                 return False
         self._batch = {"total": len(plan.items), "done": 0, "ok": 0, "exists": 0, "bytes": 0, "failed": [],
@@ -2029,7 +2143,7 @@ class ShelfView(QWidget):
         for p in b.local_paths:
             if os.path.isfile(p):
                 self._open_token = None
-                self.openRequested.emit(p)
+                self.launch_file(p)
                 return True
         if b.remote_rel and b.where in ("cloud", "synced") and self.cloud_enabled():
             return self.request_download(b, open_when_done=True)      # 仅云端（或缓存副本被删了）：下载后再打开
@@ -2064,7 +2178,7 @@ class ShelfView(QWidget):
             view.setCurrentIndex(idx)                 # 右键点在选区之外：只作用于被点的那一本
         targets = self.selected_books(view) or [b]
         m = QMenu(self)
-        m.addAction("打开", lambda: self.open_book(b))
+        m.addAction("用系统默认应用打开" if b.external else "打开", lambda: self.open_book(b))
         if not self._read_only:                       # 收藏 / 隐藏：支持多选；只读实例（没拿到单实例锁）不提供
             all_fav = all(x.fav for x in targets)
             all_hid = all(x.hidden for x in targets)

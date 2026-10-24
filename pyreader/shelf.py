@@ -33,8 +33,33 @@ from .store import is_hidden_name, load_json, normalize_rel, safe_component, sav
 WIRE_VERSION = 1
 STATE_VERSION = 1
 
-BOOK_EXTS = (".txt", ".md", ".markdown", ".epub", ".html", ".htm", ".mobi",
-             ".azw", ".azw3", ".prc", ".pdf", ".docx", ".pptx")
+# 单一来源：READABLE_EXTS = 阅读器能打开的（load_book 只认这些）；EXTERNAL_EXTS = 只存不读（有声书 / 漫画压缩包），
+# 书架可以列出、扫描、上传、下载，打开时交给系统默认应用，绝不进 load_book 与进度逻辑；BOOK_EXTS = 书架可列的全部。
+# 必须全小写且带点（endswith 吃元组）；不要放 .exe / .bat / .lnk 等可执行类型。
+READABLE_EXTS = (".txt", ".md", ".markdown", ".epub", ".html", ".htm", ".mobi",
+                 ".azw", ".azw3", ".prc", ".pdf", ".docx", ".pptx")
+AUDIO_EXTS = (".mp3", ".m4a", ".m4b", ".aac", ".flac", ".ogg", ".opus", ".wav")
+ARCHIVE_EXTS = (".zip", ".cbz", ".cbr", ".7z", ".rar")
+EXTERNAL_EXTS = AUDIO_EXTS + ARCHIVE_EXTS
+BOOK_EXTS = READABLE_EXTS + EXTERNAL_EXTS
+
+
+def media_kind(name) -> str:
+    """文件名的类别：book 电子书 | audio 有声书 / 音频 | archive 压缩包 / 漫画 | ''（不支持）。批量上传按它分类汇总、可单独勾选。"""
+    if not isinstance(name, str):
+        return ""
+    n = name.lower()
+    return "audio" if n.endswith(AUDIO_EXTS) else "archive" if n.endswith(ARCHIVE_EXTS) else "book" if n.endswith(READABLE_EXTS) else ""
+
+
+def is_readable(name) -> bool:
+    """文件名 / 路径的扩展名是否属于阅读器能打开的格式（不区分大小写）。"""
+    return isinstance(name, str) and name.lower().endswith(READABLE_EXTS)
+
+
+def is_external(name) -> bool:
+    """文件名 / 路径的扩展名是否属于「只存不读」格式（有声书 / 漫画压缩包），不区分大小写。"""
+    return isinstance(name, str) and name.lower().endswith(EXTERNAL_EXTS)
 
 FUTURE_LIMIT_MS = 24 * 3600 * 1000       # 超过「现在 + 24 小时」的时间戳属于时钟异常
 CLAMPED_TS = 1                           # 时钟异常的 ts 截断成最旧的 1ms（见 _parse_ts 的说明）
@@ -146,7 +171,7 @@ def valid_book_id(bid) -> bool:
 
 
 def valid_remote_rel(rel) -> bool:
-    """云端 library/ 下可显示的书：rel 合法、没有点 / ~$ 开头的段、扩展名在 BOOK_EXTS 内。"""
+    """云端 library/ 下可显示的文件：rel 合法、没有点 / ~$ 开头的段、扩展名在 BOOK_EXTS（可读 + 外部格式）内。"""
     if normalize_rel(rel) is None:
         return False
     segs = rel.split("/")
@@ -222,7 +247,7 @@ class ScanList(list):
 
 
 def scan_local(roots: Iterable[str], limit: int = SCAN_LIMIT, exts=BOOK_EXTS, should_stop=None) -> ScanList:
-    """遍历书库目录，返回 LocalFile 列表。忽略点 / ~$ 开头的文件与文件夹、非电子书扩展名、符号链接目录。
+    """遍历书库目录，返回 LocalFile 列表。忽略点 / ~$ 开头的文件与文件夹、不在 exts（默认 BOOK_EXTS）内的扩展名、符号链接目录。
     顺序确定（目录与文件名排序）。应在后台线程调用；should_stop() 为真时尽快返回。"""
     out = ScanList()
     for root in roots:
@@ -283,7 +308,25 @@ class Book:
     unpushed: bool = False           # 本设备对这本书的 fav / hidden 修改还没推送到云端（橙点；只是显示用，不写索引）
 
     @property
+    def external(self) -> bool:
+        """只存不读的格式（有声书 / 漫画压缩包）：按真实文件名判断，不单信 fmt（索引缓存里的 fmt 不可信，占位卡 fmt 为空）。"""
+        if is_external(self.remote_rel) or any(is_external(p) for p in self.local_paths):
+            return True
+        return bool(self.fmt) and ("." + self.fmt) in EXTERNAL_EXTS
+
+    @property
+    def readable(self) -> bool:
+        return not self.external
+
+    @property
+    def fmt_label(self) -> str:
+        """格式标签（大写）：fmt 为空的占位卡 / 索引缓存回退到真实文件名的扩展名。"""
+        return (self.fmt or os.path.splitext(self.filename)[1].lstrip(".")).upper()
+
+    @property
     def status(self) -> str:
+        if self.external:        # 外部格式永远「未读」：不进在读 / 读完 / 继续阅读
+            return "unread"
         return derive_status(self.percent, self.has_progress)
 
     @property
@@ -448,17 +491,17 @@ def build_books(local_files: Iterable[LocalFile] = (), remote_files=None, overla
             rec = digest.get(c) if isinstance(digest, dict) else None
             if isinstance(rec, dict) and (best is None or rec.get("updated", 0) > best.get("updated", 0)):
                 best = rec
-        if best:
+        if best and b.readable:      # 外部格式不记进度（别的设备 / 旧别名里的杂散记录也不采信）
             b.percent, b.progress_updated, b.progress_device = best.get("percent"), best.get("updated", 0.0), best.get("device", "")
         bm_ts, bm_off = 0.0, 0.0
         for p in b.local_paths:
-            ent = nbm.get(norm_path(p))
+            ent = nbm.get(norm_path(p)) if b.readable else None
             if ent:
                 bm_ts = max(bm_ts, _num(ent.get("_progress_ts_"), 0.0))
                 bm_off = max(bm_off, _num(ent.get("_progress_"), 0.0))
         b.has_progress = bm_off > 0
         seed = max([recent_rank.get(norm_path(p), 0.0) for p in b.local_paths] or [0.0])
-        b.last_opened = float(opened.get(bid, seed) or 0.0)
+        b.last_opened = float(opened.get(bid, seed) or 0.0) if b.readable else 0.0     # 外部格式不进「最近阅读」（旧版 recent / 索引里的杂散记录不采信）
         b.last_read = max(b.last_opened, b.progress_updated, bm_ts)
 
     # 5) 「可能是同一本书」：仅限 local: 与 remote: 两种来源之间（同来源的同名书各自独立）
@@ -871,7 +914,7 @@ def continue_candidate(books) -> Optional[Book]:
     各设备进度摘要的 updated）。没有则 None。并列时 book_id 大者胜，保证确定性。"""
     best, best_key = None, None
     for b in (books.values() if isinstance(books, dict) else books):
-        if not _visible(b) or b.status != "reading" or b.last_read <= 0:
+        if not _visible(b) or b.external or b.status != "reading" or b.last_read <= 0:
             continue
         key = (b.last_read, b.id)
         if best_key is None or key > best_key:
@@ -1205,13 +1248,17 @@ def progress_overlay(progress: Optional[dict], entries: Optional[dict] = None) -
 
 
 def note_opened(b: Book, ts: float) -> None:
-    """记一次「打开」：last_opened 与 last_read 取较大者（就地更新，不重建索引）。"""
+    """记一次「打开」：last_opened 与 last_read 取较大者（就地更新，不重建索引）。外部格式不记。"""
+    if b.external:
+        return
     b.last_opened = max(b.last_opened, float(ts))
     b.last_read = max(b.last_read, b.last_opened)
 
 
 def note_progress(b: Book, percent: float, updated: float, device: str = "") -> bool:
-    """记一次阅读进度（就地更新）。比已有记录旧则忽略，返回是否生效。"""
+    """记一次阅读进度（就地更新）。比已有记录旧则忽略，返回是否生效。外部格式不记进度。"""
+    if b.external:
+        return False
     p, u = _num(percent), _num(updated)
     if p is None or u is None or p < 0:
         return False
@@ -1315,6 +1362,9 @@ def index_from_wire(raw):
                 continue
             progress[k] = {"percent": min(100.0, p), "updated": u, "device": _clean_str(v.get("device"), 64) or ""}
     for bid, b in books.items():             # 进度百分比是独立缓存：还原到书上
+        if b.external:                       # 外部格式不还原进度 / 打开时间（旧缓存里的 last_read 也清掉）
+            b.last_read = 0.0
+            continue
         rec = progress.get(bid)
         if rec:
             b.percent, b.progress_updated, b.progress_device = rec["percent"], rec["updated"], rec["device"]
