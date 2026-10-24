@@ -29,7 +29,7 @@ from . import shelf as sh
 from . import sync as syncmod
 from .config import _log_net
 from .store import is_hidden_name, load_json, safe_component, safe_segment, save_json
-from .sync import MAX_BOOK_BYTES, download_book
+from .sync import MAX_BOOK_BYTES, download_book, max_book_bytes
 from .webdav import JSON_MAX_BYTES, MAX_FILES, WebDavClient, WebDavError, client_from_cfg
 
 LIBRARY = "library"
@@ -816,11 +816,7 @@ class ShelfSyncWorker(QObject):
         client = self._factory(cfg)
         if client is None:
             return None
-        try:
-            mb = int(cfg.get("webdav_max_book_mb") or 0)
-        except (TypeError, ValueError):
-            mb = 0
-        max_bytes = mb * MB if mb > 0 else MAX_BOOK_BYTES
+        max_bytes = max_book_bytes(cfg)
         with self._lock:
             waiters = self._downloads.get(rel)
             if waiters is not None:
@@ -972,11 +968,7 @@ class ShelfSyncWorker(QObject):
         client = self._factory(cfg)
         if client is None:
             return None
-        try:
-            mb = int(cfg.get("webdav_max_book_mb") or 0)
-        except (TypeError, ValueError):
-            mb = 0
-        max_bytes = mb * MB if mb > 0 else MAX_BOOK_BYTES
+        max_bytes = max_book_bytes(cfg)
 
         def report(sent, total):
             self.uploadProgress.emit(token, sent, total)
