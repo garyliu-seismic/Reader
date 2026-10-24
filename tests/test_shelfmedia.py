@@ -1,6 +1,8 @@
-"""外部格式（有声书 / 漫画压缩包）：书架可以存、列、传、下，但阅读器读不了——打开交给系统默认应用。
+"""媒体格式（有声书 / 漫画压缩包）：书架可以存、列、传、下。
+应用内媒体（音频、.zip / .cbz）有进度、打开发 openRequested（MainWindow 再分发到播放器 / 漫画页）；
+外部格式（.cbr / .rar / .7z，没有内置解码器）阅读器读不了——打开交给系统默认应用，永远「未读」且没有进度。
 覆盖：扩展名常量与 helper、扫描 / 校验 / 批量计划 / 云端列表接受它们（.part / 隐藏名仍被忽略）、
-状态永远「未读」且没有进度、打开不进 load_book / openRequested、下载后交给系统应用、MainWindow 入口守卫、loader 兜底。
+状态、打开路径、下载后交给系统应用、MainWindow 入口守卫、loader 兜底。
 不会真的启动任何外部程序（external_opener / QDesktopServices.openUrl 都被替换）。"""
 import os
 import time
@@ -88,12 +90,16 @@ def sync_wait(v):
 
 # ================================================================== 扩展名常量 / helper
 def test_ext_constants_invariants():
-    assert set(sh.READABLE_EXTS).isdisjoint(sh.EXTERNAL_EXTS)
-    assert sh.BOOK_EXTS == sh.READABLE_EXTS + sh.EXTERNAL_EXTS
+    assert set(sh.READABLE_EXTS).isdisjoint(sh.MEDIA_EXTS)
+    assert set(sh.INAPP_MEDIA_EXTS).isdisjoint(sh.EXTERNAL_EXTS)
+    assert sh.MEDIA_EXTS == sh.INAPP_MEDIA_EXTS + sh.EXTERNAL_EXTS
+    assert sh.BOOK_EXTS == sh.READABLE_EXTS + sh.AUDIO_EXTS + sh.ARCHIVE_EXTS                # 书架可列的全部：与分流前一致
+    assert set(sh.BOOK_EXTS) == set(sh.READABLE_EXTS) | set(sh.MEDIA_EXTS)
     for e in sh.BOOK_EXTS:
         assert e.startswith(".") and e == e.lower() and "." not in e[1:]
-    for e in (".mp3", ".m4a", ".m4b", ".aac", ".flac", ".ogg", ".opus", ".wav", ".zip", ".cbz", ".cbr", ".7z", ".rar"):
-        assert e in sh.EXTERNAL_EXTS
+    for e in (".mp3", ".m4a", ".m4b", ".aac", ".flac", ".ogg", ".opus", ".wav", ".zip", ".cbz"):
+        assert e in sh.INAPP_MEDIA_EXTS
+    assert sh.EXTERNAL_EXTS == (".cbr", ".7z", ".rar")                                         # 只有没有解码器的才交给系统应用
     for e in (".exe", ".bat", ".lnk", ".cmd", ".js", ".msi", ".part"):                 # 可执行类型永远不进白名单
         assert e not in sh.BOOK_EXTS
     assert sh.READABLE_EXTS == (".txt", ".md", ".markdown", ".epub", ".html", ".htm", ".mobi",
@@ -101,11 +107,20 @@ def test_ext_constants_invariants():
 
 
 def test_is_readable_is_external_case_insensitive():
-    assert sh.is_external("a/b/三体.MP3") and sh.is_external("X.Cbz") and sh.is_external(r"C:\x\y.7Z")
+    assert sh.is_external("a/b/三体.CBR") and sh.is_external("X.Rar") and sh.is_external(r"C:\x\y.7Z")
     assert not sh.is_external("a.epub") and not sh.is_external("a.exe") and not sh.is_external("noext")
+    assert not sh.is_external("a/b/三体.MP3") and not sh.is_external("X.Cbz") and not sh.is_external("y.zip")
     assert sh.is_readable("a.EPUB") and sh.is_readable("/x/y.pdf") and not sh.is_readable("a.mp3")
-    assert not sh.is_external("a.mp3.part") and not sh.is_external(None) and not sh.is_readable(None)
-    assert not sh.is_readable("a.zip") and not sh.is_external("a.zip.txt")
+    assert not sh.is_external("a.cbr.part") and not sh.is_external(None) and not sh.is_readable(None)
+    assert not sh.is_readable("a.zip") and not sh.is_external("a.rar.txt")
+    assert sh.is_inapp_media("a/b/三体.MP3") and sh.is_inapp_media("X.Cbz") and sh.is_inapp_media("y.ZIP")
+    assert not sh.is_inapp_media("a.cbr") and not sh.is_inapp_media("a.epub") and not sh.is_inapp_media(None)
+    assert not sh.is_inapp_media("a.zip.txt") and not sh.is_inapp_media("a.mp3.part")
+
+
+def test_inapp_kind_dispatch_table():
+    assert [sh.inapp_kind(n) for n in ("a.MP3", "b.m4b", "c.wav", "d.zip", "e.CBZ")] == ["audio", "audio", "audio", "comic", "comic"]
+    assert [sh.inapp_kind(n) for n in ("a.cbr", "b.rar", "c.7z", "d.epub", "e.pdf", "f.exe", "g", None)] == [""] * 8
 
 
 # ================================================================== 本地扫描
@@ -177,17 +192,17 @@ def test_fetch_library_lists_external_but_not_part_or_hidden(server):
 
 # ================================================================== Book 状态：没有进度 / 不在读
 def test_build_books_external_never_has_progress_or_status():
-    local = [lf("a.zip", "漫画"), lf("b.epub", "小说")]
+    local = [lf("a.cbr", "漫画"), lf("b.epub", "小说")]
     bz, be = sync.book_id(local[0].path), sync.book_id(local[1].path)
-    rid = "remote:有声书/c.mp3"
+    rid = "remote:有声书/c.7z"
     overlay = {"entries": {}, "progress": {bz: {"percent": 60.0, "updated": 50.0, "device": "d"},
                                            be: {"percent": 60.0, "updated": 50.0, "device": "d"},
                                            rid: {"percent": 99.0, "updated": 60.0, "device": "d"}}}
     bms = {local[0].path: {"_progress_": 500, "_progress_ts_": 70.0}, local[1].path: {"_progress_": 500, "_progress_ts_": 70.0}}
-    books = sh.build_books(local, [("有声书/c.mp3", 10, 1.0)], overlay, bookmarks=bms)
+    books = sh.build_books(local, [("有声书/c.7z", 10, 1.0)], overlay, bookmarks=bms)
     z, e, m = books[bz], books[be], books[rid]
-    assert (z.fmt, z.title, z.external, z.readable) == ("zip", "a", True, False)
-    assert (m.fmt, m.title, m.where) == ("mp3", "c", "cloud")
+    assert (z.fmt, z.title, z.external, z.readable, z.inapp_media) == ("cbr", "a", True, False, False)
+    assert (m.fmt, m.title, m.where) == ("7z", "c", "cloud")
     for b in (z, m):
         assert b.percent is None and not b.has_progress and b.status == "unread" and b.last_read == 0
         assert sv.progress_text(b) == ""
@@ -204,30 +219,34 @@ def test_build_books_external_never_has_progress_or_status():
 
 
 def test_external_placeholder_and_index_fmt_not_trusted():
-    b = sh.Book("remote:x/a.cbz", "a", "", 0, "cloud:x", "", "missing", "x/a.cbz")      # 其它设备的占位：fmt 为空
+    b = sh.Book("remote:x/a.cbr", "a", "", 0, "cloud:x", "", "missing", "x/a.cbr")      # 其它设备的占位：fmt 为空
     assert b.external and b.status == "unread"
-    c = sh.Book("remote:x/a.epub", "a", "mp3", 1, "cloud:x", "", "cloud", "x/a.epub")    # 索引缓存里 fmt 可信度低
+    c = sh.Book("remote:x/a.epub", "a", "rar", 1, "cloud:x", "", "cloud", "x/a.epub")    # 索引缓存里 fmt 可信度低
     assert c.external is True                                                             # fmt 说是外部格式：按外部处理（更保守）
-    d = sh.Book("remote:x/a.mp3", "a", "epub", 1, "cloud:x", "", "cloud", "x/a.mp3")
+    d = sh.Book("remote:x/a.7z", "a", "epub", 1, "cloud:x", "", "cloud", "x/a.7z")
     assert d.external is True                                                             # 真实文件名为准
+    e = sh.Book("remote:x/a.mp3", "a", "", 0, "cloud:x", "", "missing", "x/a.mp3")        # 占位的音频：应用内媒体，不是外部
+    assert not e.external and e.inapp_media and e.readable
+    f = sh.Book("remote:x/a.cbz", "a", "epub", 1, "cloud:x", "", "cloud", "x/a.cbz")
+    assert f.inapp_media and not f.external                                               # 真实文件名为准
 
 
 def test_index_roundtrip_keeps_external_cloud_book():
-    books = sh.build_books([], [("有声书/c.mp3", 10, 1.0)])
+    books = sh.build_books([], [("有声书/c.rar", 10, 1.0)])
     wire = sh.index_to_wire(books)
     back = sh.index_from_wire(wire)[0]
-    assert "remote:有声书/c.mp3" in back and back["remote:有声书/c.mp3"].external
+    assert "remote:有声书/c.rar" in back and back["remote:有声书/c.rar"].external
 
 
 # ================================================================== ShelfView：打开
 def test_open_local_external_uses_os_app_not_reader(tmp_path, rb):
     lib = tmp_path / "lib"
     lib.mkdir()
-    f = lib / "三体.mp3"
-    f.write_bytes(b"ID3" * 100)
+    f = lib / "三体.cbr"
+    f.write_bytes(b"Rar!" * 100)
     v = make_view(tmp_path, None, [str(lib)])
     v.rescan(); settle(v)
-    b = next(x for x in v.books.values() if x.fmt == "mp3")
+    b = next(x for x in v.books.values() if x.fmt == "cbr")
     assert b.title == "三体" and b.status == "unread"
     assert v.open_book(b) is True
     assert v.launched == [str(f)] and v.opened == []                    # 交给系统应用，没有 openRequested
@@ -264,22 +283,22 @@ def test_launch_file_never_starts_non_whitelisted_extension(tmp_path, rb):
 
 def test_cloud_only_external_downloads_then_opens_with_os_app(server, tmp_path, rb):
     h, url = server
-    put_book(h, "有声书/三体.mp3", b"ID3" + b"x" * 20)
+    put_book(h, "有声书/三体.7z", b"7z\xbc\xaf" + b"x" * 20)
     v = make_view(tmp_path, url)
     v.show()
     sync_wait(v)
-    b = v.books["remote:有声书/三体.mp3"]
-    assert b.where == "cloud" and b.fmt == "mp3" and sv.badge_text(b) == "仅云端"
+    b = v.books["remote:有声书/三体.7z"]
+    assert b.where == "cloud" and b.fmt == "7z" and sv.badge_text(b) == "仅云端"
     assert v.open_book(b) is True and v.model.busy == {b.id}
     assert wait_for(lambda: v.launched)
-    dest = str(rb / "有声书" / "三体.mp3")
-    assert v.launched == [dest] and open(dest, "rb").read().startswith(b"ID3")
+    dest = str(rb / "有声书" / "三体.7z")
+    assert v.launched == [dest] and open(dest, "rb").read().startswith(b"7z")
     assert v.opened == [] and v._opened == {}
     settle(v)
     assert v.books[b.id].where == "synced" and v.books[b.id].status == "unread"
     v.launched.clear()
     assert v.open_book(v.books[b.id]) is True and v.launched == [dest]      # 已有副本：直接打开，不再下载
-    assert len([r for r in h.log if r[0] == "GET" and r[1].endswith("三体.mp3")]) == 1
+    assert len([r for r in h.log if r[0] == "GET" and r[1].endswith("三体.7z")]) == 1
 
 
 def test_stale_external_download_does_not_launch(server, tmp_path, rb):
@@ -299,7 +318,7 @@ def test_stale_external_download_does_not_launch(server, tmp_path, rb):
 
 def test_external_not_in_progress_wanted_but_book_is(server, tmp_path, rb):
     h, url = server
-    put_book(h, "a.mp3", b"1")
+    put_book(h, "a.rar", b"1")
     put_book(h, "b.epub", b"2")
     v = make_view(tmp_path, url)
     sync_wait(v)
@@ -309,8 +328,8 @@ def test_external_not_in_progress_wanted_but_book_is(server, tmp_path, rb):
 def test_note_opened_and_progress_ignore_external(tmp_path, rb):
     lib = tmp_path / "lib"
     lib.mkdir()
-    f = lib / "a.zip"
-    f.write_bytes(b"PK")
+    f = lib / "a.7z"
+    f.write_bytes(b"7z")
     v = make_view(tmp_path, None, [str(lib)])
     v.rescan(); settle(v)
     v.note_opened(str(f))
@@ -319,12 +338,12 @@ def test_note_opened_and_progress_ignore_external(tmp_path, rb):
 
 
 def test_card_and_list_show_format_without_progress(tmp_path, rb):
-    b = sh.Book("remote:a.m4b", "a", "m4b", 1, "cloud:", "", "cloud", "a.m4b", percent=50.0)
+    b = sh.Book("remote:a.rar", "a", "rar", 1, "cloud:", "", "cloud", "a.rar", percent=50.0)
     assert sv.progress_text(b) == ""
     m = sv.BookModel()
     m.set_books([b])
     from PySide6.QtCore import Qt
-    assert m.data(m.index(0, 1), Qt.ItemDataRole.DisplayRole) == "M4B"
+    assert m.data(m.index(0, 1), Qt.ItemDataRole.DisplayRole) == "RAR"
     assert m.data(m.index(0, 2), Qt.ItemDataRole.DisplayRole) == ""
 
 
@@ -354,12 +373,12 @@ def test_main_window_never_loads_external(win, monkeypatch, tmp_path):
     pulled = []
     monkeypatch.setattr(win.sync, "pull", lambda *a, **k: pulled.append(a))
     assert win._shelf_visible()
-    for name in ("a.mp3", "b.ZIP", "c.cbz"):
+    for name in ("a.cbr", "b.RAR", "c.7z"):
         p = str(tmp_path / name)
         win.load_book(p)
         win._open_from_shelf(p)
     assert built == [] and noted == [] and pulled == []
-    assert launched == [str(tmp_path / n) for n in ("a.mp3", "a.mp3", "b.ZIP", "b.ZIP", "c.cbz", "c.cbz")]
+    assert launched == [str(tmp_path / n) for n in ("a.cbr", "a.cbr", "b.RAR", "b.RAR", "c.7z", "c.7z")]
     assert win._shelf_visible() and not win._shelf_open_pending and win.book_path in (None, "")
     assert not win.cfg.get("recent")
 
@@ -394,26 +413,26 @@ def test_loader_refuses_external_instead_of_reading_it_as_text(tmp_path):
 def test_stale_external_in_recent_and_opened_not_seeded(tmp_path):
     d = tmp_path / "lib"
     d.mkdir()
-    (d / "a.zip").write_bytes(b"1")
-    (d / "b.MP3").write_bytes(b"1")
+    (d / "a.cbr").write_bytes(b"1")
+    (d / "b.RAR").write_bytes(b"1")
     (d / "c.txt").write_bytes(b"1")
     fs = sh.scan_local([str(d)])
     paths = {f.name: f.path for f in fs}
     bid = {f.name: sync.book_id(f.path) for f in fs}
-    bs = sh.build_books(fs, None, recent=[paths["a.zip"], paths["b.MP3"], paths["c.txt"]],
-                        opened={bid["a.zip"]: 99.0, bid["b.MP3"]: 98.0})        # 旧版本留下的杂散记录
-    assert bs[bid["a.zip"]].last_read == 0 and bs[bid["b.MP3"]].last_read == 0
+    bs = sh.build_books(fs, None, recent=[paths["a.cbr"], paths["b.RAR"], paths["c.txt"]],
+                        opened={bid["a.cbr"]: 99.0, bid["b.RAR"]: 98.0})        # 旧版本留下的杂散记录
+    assert bs[bid["a.cbr"]].last_read == 0 and bs[bid["b.RAR"]].last_read == 0
     assert [b.title for b in sh.filter_books(bs, "recent")] == ["c"]            # 外部格式不上「最近阅读」
     assert sh.continue_candidate(bs) is None
 
 
 def test_index_restore_drops_external_opened_and_progress():
-    books = sh.build_books([], [("有声书/c.mp3", 10, 1.0), ("b.epub", 10, 1.0)])
-    wire = sh.index_to_wire(books, {"remote:有声书/c.mp3": 50.0, "remote:b.epub": 60.0},
-                            {"remote:有声书/c.mp3": {"percent": 40.0, "updated": 70.0, "device": "d"}})
+    books = sh.build_books([], [("有声书/c.7z", 10, 1.0), ("b.epub", 10, 1.0)])
+    wire = sh.index_to_wire(books, {"remote:有声书/c.7z": 50.0, "remote:b.epub": 60.0},
+                            {"remote:有声书/c.7z": {"percent": 40.0, "updated": 70.0, "device": "d"}})
     back, opened, _prog = sh.index_from_wire(wire)
-    assert back["remote:有声书/c.mp3"].last_read == 0 and back["remote:有声书/c.mp3"].percent is None
-    assert back["remote:有声书/c.mp3"].last_opened == 0
+    assert back["remote:有声书/c.7z"].last_read == 0 and back["remote:有声书/c.7z"].percent is None
+    assert back["remote:有声书/c.7z"].last_opened == 0
     assert back["remote:b.epub"].last_opened == 60.0
 
 
@@ -532,16 +551,16 @@ def test_oversize_single_upload_blocked_with_hint(server, tmp_path, rb):
 
 def test_external_download_launches_even_when_hidden_or_superseded(server, tmp_path, rb):
     h, url = server
-    put_book(h, "有声书/a.mp3", b"ID3" + b"x" * 20)
+    put_book(h, "有声书/a.rar", b"Rar!" + b"x" * 20)
     v = make_view(tmp_path, url)
     v.show()
     sync_wait(v)
-    b = v.books["remote:有声书/a.mp3"]
+    b = v.books["remote:有声书/a.rar"]
     assert v.request_download(b, open_when_done=True)
     v.hide()                                              # 下载期间用户切走了书架
     v._open_token = None                                  # 并且打开了别的书（意图被取代）
     assert wait_for(lambda: v.launched)
-    assert v.launched == [str(rb / "有声书" / "a.mp3")] and v.opened == []       # 系统应用不会抢阅读窗口，所以照样启动
+    assert v.launched == [str(rb / "有声书" / "a.rar")] and v.opened == []       # 系统应用不会抢阅读窗口，所以照样启动
 
 
 def test_readable_stale_download_tells_user_instead_of_silence(server, tmp_path, rb):
@@ -598,8 +617,8 @@ def test_worker_upload_records_trusted_rel(server, tmp_path):
 
 
 def test_fmt_label_falls_back_to_filename_for_placeholders():
-    b = sh.build_books([], [], {"entries": {"remote:有声书/a.mp3": {"meta": {"title": "a"}}}, "progress": {}})["remote:有声书/a.mp3"]
-    assert b.fmt == "" and b.external and b.fmt_label == "MP3"
+    b = sh.build_books([], [], {"entries": {"remote:有声书/a.rar": {"meta": {"title": "a"}}}, "progress": {}})["remote:有声书/a.rar"]
+    assert b.fmt == "" and b.external and b.fmt_label == "RAR"
     assert sh.Book("local:" + "0" * 40, "t", "", 0, "", "", "missing").fmt_label == ""
     assert sh.media_kind("a.MP3") == "audio" and sh.media_kind("b.cbz") == "archive" and sh.media_kind("c.epub") == "book"
     assert sh.media_kind("d.exe") == "" and sh.media_kind(None) == ""
