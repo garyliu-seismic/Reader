@@ -345,21 +345,22 @@ class BookDelegate(QStyledItemDelegate):
                 p.setPen(Qt.PenStyle.NoPen)
                 p.setBrush(QColor("#ff8c1a"))
                 p.drawEllipse(QRect(x, cover.top() + 8, 9, 9))
-        if b.external:                                    # 外部格式（有声书 / 漫画压缩包）：封面左下角标格式，不画进度条
+        has_bar = b.percent is not None and not b.external
+        if b.external or b.inapp_media:                   # 媒体（有声书 / 漫画压缩包）：封面左下角标格式；外部格式没有进度条
             ef = QFont(option.font)
             ef.setBold(True)
             ef.setPixelSize(11)
             efm = QFontMetrics(ef)
             et = b.fmt_label[:6]
             if et:                                        # 占位卡 fmt 为空时回退到文件名扩展名；仍为空就不画空药丸
-                epill = QRect(cover.left() + 12, cover.bottom() - 22, efm.horizontalAdvance(et) + 10, efm.height() + 2)
+                epill = QRect(cover.left() + 12, cover.bottom() - (30 if has_bar else 22), efm.horizontalAdvance(et) + 10, efm.height() + 2)
                 p.setPen(Qt.PenStyle.NoPen)
                 p.setBrush(QColor(0, 0, 0, 120))
                 p.drawRoundedRect(epill, 4, 4)
                 p.setFont(ef)
                 p.setPen(QColor("#ffffff"))
                 p.drawText(epill, int(Qt.AlignmentFlag.AlignCenter), et)
-        elif b.percent is not None:                       # 封面底部的进度条
+        if has_bar:                                       # 封面底部的进度条
             track = QRect(cover.left() + 12, cover.bottom() - 10, cover.width() - 20, 4)
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QColor(0, 0, 0, 90))
@@ -1382,12 +1383,18 @@ class ShelfView(QWidget):
         return bool(QDesktopServices.openUrl(QUrl.fromLocalFile(path)))
 
     def launch_file(self, path: str) -> bool:
-        """打开一个本地文件的唯一出口：阅读器能读的发 openRequested（MainWindow 再 load_book）；
-        外部格式（有声书 / 漫画压缩包）交给系统默认应用，不切页、不 note_opened、不记进度。
-        系统应用只启动 EXTERNAL_EXTS 内的扩展名：这里不能变成任意文件启动器。"""
+        """打开一个本地文件的唯一出口：阅读器能读的、应用内媒体（音频 / .zip / .cbz）发 openRequested（MainWindow 按类别分发）；
+        外部格式（.cbr / .rar / .7z）交给系统默认应用，不切页、不 note_opened、不记进度。"""
         if not sh.is_external(path):
             self.openRequested.emit(path)
             return True
+        return self.open_external(path)
+
+    def open_external(self, path: str) -> bool:
+        """交给系统默认应用。只启动媒体扩展名（MEDIA_EXTS）：这里不能变成任意文件启动器。
+        应用内媒体打不开（没有音频设备 / 不是漫画的 .zip）时 MainWindow 也走这里作兜底。"""
+        if not path.lower().endswith(sh.MEDIA_EXTS):
+            return False
         name = os.path.basename(path)
         try:
             ok = bool(self.external_opener(path))

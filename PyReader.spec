@@ -86,6 +86,17 @@ def _drop_qt_dll(name: str) -> bool:
 
 a.binaries = [b for b in a.binaries if not _drop_qt_dll(b[0])]
 
+# ---- 自检：播放器（有声书 QMediaPlayer）与朗读（QAudioSink）都靠 Qt Multimedia 的 ffmpeg 后端 ----
+# Qt6Multimedia / Qt6Network 与 FFmpeg DLL、plugins/multimedia/ffmpegmediaplugin.dll 缺任何一个，包里就「能启动但放不出声」，
+# 而且只有在用户机器上才会发现；上面的前缀过滤误伤（例如以后给 'Qt6Multimedia' 加了前缀）时让构建直接失败。
+_NEED_BINARIES = ('Qt6Multimedia.dll', 'Qt6Network.dll', 'ffmpegmediaplugin.dll')
+_NEED_PREFIXES = ('avcodec', 'avformat', 'avutil', 'swresample', 'swscale')
+_have = [os.path.basename(b[0]) for b in a.binaries]
+_missing = ([n for n in _NEED_BINARIES if n not in _have]
+            + [p for p in _NEED_PREFIXES if not any(h.startswith(p) for h in _have)])
+if _missing:
+    raise SystemExit('PyReader.spec: 音频播放需要的 Qt Multimedia / FFmpeg 文件被剔除或没被收集：' + ', '.join(_missing))
+
 # ---- 过滤 Qt 多语言翻译 / QML / WebEngine 资源（应用为中文，无需 186 种翻译）----
 def _drop_qt_data(name: str) -> bool:
     n = name.replace('\\', '/')
