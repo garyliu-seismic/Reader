@@ -23,7 +23,7 @@ from PySide6.QtCore import (QAbstractTableModel, QCoreApplication, QModelIndex, 
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontMetrics, QGuiApplication, QPainter, QPen
 from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QHBoxLayout, QHeaderView,
                                QInputDialog, QLabel, QLineEdit, QListView, QListWidget, QListWidgetItem, QMenu,
-                               QMessageBox, QPushButton, QStackedWidget, QStyle, QStyledItemDelegate, QToolButton,
+                               QMessageBox, QPlainTextEdit, QPushButton, QStackedWidget, QStyle, QStyledItemDelegate, QToolButton,
                                QTreeView, QVBoxLayout, QWidget)
 
 from . import shelf as sh
@@ -475,6 +475,56 @@ class UploadDialog(QDialog):
         return self.folder(), [(p, n) for (p, _n), n in zip(self.items, self.names())]
 
 
+class BatchUploadDialog(QDialog):
+    """批量上传前的确认对话框：显示数量 / 总大小 / 跳过明细，可给云端文件夹加一个统一前缀。
+    result_value()：前缀（'' = 直接用本地目录结构）；前缀不合法时「开始上传」不可用。"""
+
+    def __init__(self, plan: "ss.BatchPlan", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("批量上传到云端书库")
+        self.resize(560, 420)
+        lay = QVBoxLayout(self)
+        head = QLabel(f"将上传 {len(plan.items)} 本书，共 {fmt_size(plan.total_bytes)}。\n"
+                      "云端文件夹沿用本地书库的子文件夹结构；云端已有同名文件的自动跳过，不会覆盖；"
+                      "失败的书最后集中列出，之后可以再点一次，只会补传没传上的。")
+        head.setTextFormat(Qt.TextFormat.PlainText)
+        head.setWordWrap(True)
+        lay.addWidget(head)
+        nskip = sum(len(v) for v in plan.skipped.values())
+        if nskip:
+            lay.addWidget(QLabel(f"已自动跳过 {nskip} 个文件："))
+            box = QPlainTextEdit()
+            box.setReadOnly(True)
+            box.setPlainText("\n".join(f"【{why}】{len(names)} 个\n    " + "\n    ".join(names[:30]) +
+                                       (f"\n    …… 还有 {len(names) - 30} 个" if len(names) > 30 else "")
+                                       for why, names in plan.skipped.items()))
+            lay.addWidget(box, 1)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("统一前缀文件夹（可选）"))
+        self.prefix = QLineEdit()
+        self.prefix.setPlaceholderText("如 我的书库；留空 = 直接用本地目录结构")
+        self.prefix.textChanged.connect(lambda _t: self._validate())
+        row.addWidget(self.prefix, 1)
+        lay.addLayout(row)
+        self.error = QLabel()
+        lay.addWidget(self.error)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText("开始上传")
+        self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        lay.addWidget(self.buttons)
+        self._validate()
+
+    def _validate(self):
+        bad = ss.normalize_folder(self.prefix.text()) is None
+        self.error.setText("前缀文件夹名不合法（不能含 \\ : 等字符，不能以 . 开头）" if bad else "")
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(not bad)
+
+    def result_value(self) -> Optional[str]:
+        return ss.normalize_folder(self.prefix.text())
+
+
 # ================================================================== 书架页
 class ShelfView(QWidget):
     openRequested = Signal(str)          # 要打开的本地文件路径（由 MainWindow 调 load_book）
@@ -527,6 +577,9 @@ class ShelfView(QWidget):
         self.upload_chooser: Callable = self._default_upload_chooser                     # (items, folders) -> (folder, [(path, name)]) | None
         self.rename_chooser: Callable = self._default_rename_chooser                     # (name, folder, message) -> 新文件名 | None
         self.run_menu: Callable = lambda menu, global_pos: menu.exec(global_pos)         # 右键菜单怎么弹出（测试替换成直接选动作）
+        self.batch_chooser: Callable = self._default_batch_chooser                       # (plan) -> 前缀文件夹 str | None（取消）
+        self.batch_reporter: Callable = self._default_batch_reporter                     # (摘要, 失败明细 list) 批量结束后的汇报
+        self._batch: Optional[dict] = None            # 批量上传进行中的统计；None = 没有批量任务
         self._overlay: Optional[dict] = None          # 本设备的覆盖层（fav / hidden / meta + progress 摘要）；主线程独占，可写
         self._disk_ov: Optional[dict] = None          # 只用来显示的覆盖层（读盘一次，不创建文件）；_overlay 建立后不再用
         self._merged: Optional[dict] = None           # 本设备 + 其它设备合并后的视图缓存（编辑 / peers 变化后置 None）
@@ -632,6 +685,14 @@ class ShelfView(QWidget):
         top.addWidget(self.btn_grid)
         top.addWidget(self.btn_list)
         top.addWidget(self.btn_refresh)
+        self.btn_batch_upload = QToolButton(); self.btn_batch_upload.setText("⬆"); self.btn_batch_upload.setToolTip(
+            "批量上传本地书到云端（只上传云端还没有的，已有同名的自动跳过）")
+        self.btn_batch_upload.clicked.connect(lambda: self.start_batch_upload())
+        self.btn_batch_stop = QToolButton(); self.btn_batch_stop.setText("⏹"); self.btn_batch_stop.setToolTip("停止批量上传（当前这本传完后停止）")
+        self.btn_batch_stop.clicked.connect(self.cancel_batch)
+        self.btn_batch_stop.hide()
+        top.addWidget(self.btn_batch_upload)
+        top.addWidget(self.btn_batch_stop)
 
         self.sidebar = QListWidget()
         self.sidebar.setFixedWidth(190)
@@ -1736,6 +1797,11 @@ class ShelfView(QWidget):
             self._update_status()
             self.uploadStatus.emit(self._notice, 8000)
             return False
+        if self._batch is not None:
+            self._notice = "批量上传进行中，请等它结束（或先点 ⏹ 停止）再单独上传"
+            self._update_status()
+            self.uploadStatus.emit(self._notice, 8000)
+            return False
         from . import sync as syncmod
         items, skipped = [], []
         for p in paths or ():
@@ -1772,12 +1838,16 @@ class ShelfView(QWidget):
         self._upload_seq += 1
         tok = self._upload_seq
         self._upload_cur = (tok, path, folder, name)
-        self._notice = f"正在上传：{name}"
+        self._notice = f"{self._batch_prefix()}正在上传：{name}"
         self._update_status()
         self.uploadStatus.emit(self._notice, 0)
         if self._cloud.upload(self._cfg(), path, folder, name, tok) is None:
             self._upload_cur = None
+            self._upload_queue.clear()
             self._notice = "未启用云同步，无法上传"
+            if self._batch is not None:
+                self._finish_batch()
+                return
             self._update_status()
             self.uploadStatus.emit(self._notice, 8000)
 
@@ -1787,7 +1857,10 @@ class ShelfView(QWidget):
             return                                     # 迟到的进度（该次上传已结束）直接丢弃
         mb = 1024 * 1024
         queued = f"（队列里还有 {len(self._upload_queue)} 本）" if self._upload_queue else ""
-        self._notice = f"正在上传：{cur[3]} {min(100, sent * 100 // total)}%（{sent / mb:.1f}/{total / mb:.1f} MB）{queued}"
+        if self._batch is not None:
+            queued = ""                                # 批量时前缀里已经有 第几本 / 共几本
+        self._notice = (f"{self._batch_prefix()}正在上传：{cur[3]} {min(100, sent * 100 // total)}%"
+                        f"（{sent / mb:.1f}/{total / mb:.1f} MB）{queued}")
         self._update_status()
         self.uploadStatus.emit(self._notice, 0)
 
@@ -1797,6 +1870,9 @@ class ShelfView(QWidget):
             return
         _t, path, folder, name = cur
         self._upload_cur = None
+        if self._batch is not None:
+            self._on_batch_item_done(path, name, res)
+            return
         if res.status == "ok":
             self._notice = res.message + "（其它设备约 1 分钟后能看到）"
             self.sync_cloud(force=True)
@@ -1813,6 +1889,133 @@ class ShelfView(QWidget):
         self.uploadStatus.emit(self._notice, 0 if self._upload_queue else 15000)   # 队列里还有书：马上被下一条「正在上传」盖掉
         self.uploadFinished.emit(res)
         self._pump_uploads()
+
+    # ------------------------------------------------------------ 批量上传：同一条队列，但「云端已有」直接跳过、不弹改名
+    BATCH_MAX_CONSECUTIVE_ERRORS = 5     # 连续失败这么多本就停（服务器挂了 / 断网时不要把上千本都试一遍）
+
+    def _default_batch_chooser(self, plan):
+        dlg = BatchUploadDialog(plan, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return dlg.result_value()
+
+    def _default_batch_reporter(self, summary: str, failed: List[str]):
+        box = QMessageBox(QMessageBox.Icon.Warning if failed else QMessageBox.Icon.Information, "批量上传结束", summary, parent=self)
+        if failed:
+            box.setDetailedText("\n".join(failed))
+        box.exec()
+
+    def _batch_prefix(self) -> str:
+        b = self._batch
+        return f"批量上传 {min(b['done'] + 1, b['total'])}/{b['total']} · " if b is not None else ""
+
+    def start_batch_upload(self, paths=None) -> bool:
+        """把本机书库里云端还没有的书批量上传到云端（保持子文件夹结构）。paths = 只上传这些文件（多选右键），None = 全部。
+        只由用户操作触发；已有同名文件一律跳过，绝不覆盖；上传完成后只刷新一次云端列表。"""
+        if not self.cloud_enabled():
+            self._notice = "未启用云同步，无法上传"
+            self._update_status()
+            self.uploadStatus.emit(self._notice, 8000)
+            return False
+        if self._batch is not None or self._upload_cur is not None or self._upload_queue:
+            self._notice = "已经有上传在进行，请等它结束再开始批量上传"
+            self._update_status()
+            self.uploadStatus.emit(self._notice, 8000)
+            return False
+        from . import sync as syncmod
+        want = {sh.norm_path(p) for p in paths} if paths is not None else None
+        files = [lf for lf in (self._local_files or []) if want is None or sh.norm_path(lf.path) in want]
+        cloud_rels = [b.remote_rel for b in self._books.values() if b.remote_rel and not b.removed]
+        max_bytes = syncmod.max_book_bytes(self._cfg())
+        is_cached = lambda p: syncmod._remote_rel(p) is not None
+        plan = ss.plan_batch_upload(files, cloud_rels, max_bytes, "", is_cached)
+        if not plan.items:
+            self._notice = ("没有需要上传的书：" + "；".join(f"{why} {len(n)} 个" for why, n in plan.skipped.items())
+                            if plan.skipped else "没有需要上传的书（本机书库为空，或还没扫描完）")
+            self._update_status()
+            self.uploadStatus.emit(self._notice, 8000)
+            return False
+        prefix = self.batch_chooser(plan)
+        if prefix is None:
+            return False
+        if prefix:
+            plan = ss.plan_batch_upload(files, cloud_rels, max_bytes, prefix, is_cached)   # 前缀变了，「云端已有」要按新位置重算
+            if not plan.items:
+                return False
+        self._batch = {"total": len(plan.items), "done": 0, "ok": 0, "exists": 0, "bytes": 0, "failed": [],
+                       "errs": 0, "cancelled": False, "aborted": False, "skipped": sum(map(len, plan.skipped.values()))}
+        self._upload_queue = list(plan.items)
+        self.btn_batch_upload.setEnabled(False)
+        self.btn_batch_stop.show()
+        self._pump_uploads()
+        return True
+
+    def cancel_batch(self):
+        """停止批量上传：队列清空，正在传的这一本传完（不中断，免得留下半截文件）。"""
+        b = self._batch
+        if b is None:
+            return
+        b["cancelled"] = True
+        self._upload_queue.clear()
+        if self._upload_cur is None:
+            self._finish_batch()
+        else:
+            self._notice = "正在停止批量上传（等当前这本传完）…"
+            self._update_status()
+            self.uploadStatus.emit(self._notice, 0)
+
+    def _on_batch_item_done(self, path: str, name: str, res):
+        b = self._batch
+        b["done"] += 1
+        if res.status == "ok":
+            b["ok"] += 1
+            b["errs"] = 0
+            try:
+                b["bytes"] += os.path.getsize(path)
+            except OSError:
+                pass
+        elif res.status == "exists":
+            b["exists"] += 1
+            b["errs"] = 0
+        else:
+            b["failed"].append(f"{res.rel or name}：{res.message or '上传失败'}")
+            b["errs"] += 1
+            if b["errs"] >= self.BATCH_MAX_CONSECUTIVE_ERRORS and self._upload_queue:
+                b["aborted"] = True
+                self._upload_queue.clear()
+        self.uploadFinished.emit(res)
+        if self._upload_queue:
+            self._pump_uploads()
+        else:
+            self._finish_batch()
+
+    def _finish_batch(self):
+        b, self._batch = self._batch, None
+        if b is None:
+            return
+        self.btn_batch_upload.setEnabled(True)
+        self.btn_batch_stop.hide()
+        left = b["total"] - b["done"]
+        parts = [f"成功 {b['ok']} 本（{fmt_size(b['bytes'])}）"]
+        if b["exists"]:
+            parts.append(f"云端已有 {b['exists']} 本（已跳过）")
+        if b["failed"]:
+            parts.append(f"失败 {len(b['failed'])} 本")
+        if left:
+            parts.append(f"未处理 {left} 本")
+        head = "批量上传已停止：" if b["cancelled"] else ("批量上传中止（连续失败 %d 本，请检查网络 / 服务器）：" % self.BATCH_MAX_CONSECUTIVE_ERRORS
+                                                    if b["aborted"] else "批量上传完成：")
+        summary = head + "，".join(parts) + "。" + ("再点 ⬆ 会只补传没传上的。" if (b["failed"] or left) else "")
+        self._notice = summary
+        self._update_status()
+        self.uploadStatus.emit(summary, 20000)
+        if b["failed"]:
+            from .config import _log_net
+            for line in b["failed"]:
+                _log_net(f"[书架] 批量上传失败 {line}")
+        if b["ok"]:
+            self.sync_cloud(force=True)
+        self.batch_reporter(summary, b["failed"])
 
     # ------------------------------------------------------------ 交互
     def _on_activated(self, index: QModelIndex):
@@ -1872,7 +2075,11 @@ class ShelfView(QWidget):
         if b.remote_rel and not b.local_paths and not b.removed and self.cloud_enabled():
             m.addAction("下载到本机", lambda: self.request_download(b, open_when_done=False))
         if b.where == "local" and b.local_paths and self.cloud_enabled():
-            m.addAction("上传到云端…（手动，需确认）", lambda: self.start_upload([b.local_paths[0]]))
+            locals_ = [x.local_paths[0] for x in targets if x.where == "local" and x.local_paths]
+            if len(locals_) > 1:
+                m.addAction(f"批量上传选中的 {len(locals_)} 本到云端…", lambda: self.start_batch_upload(locals_))
+            else:
+                m.addAction("上传到云端…（手动，需确认）", lambda: self.start_upload([b.local_paths[0]]))
         if b.remote_rel:
             m.addAction("复制云端路径", lambda: QGuiApplication.clipboard().setText("library/" + b.remote_rel))
         if b.local_paths:
