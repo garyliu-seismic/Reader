@@ -298,10 +298,12 @@ def load_env_defaults() -> dict:
       AZURE_TTS_KEY2             → azure_tts_key2
       AZURE_TTS_REGION2          → azure_tts_region2
       PYREADER_PROXY             → proxy（Reader 专用代理，如 sing-box 的 http://127.0.0.1:1081）
+      WEBDAV_URL                 → webdav_url（WebDAV 书库地址；用户名/密码不进 .env，由用户在设置界面填写）
     """
     for p in _env_search_paths():
         env = _parse_dotenv(p)
-        if env.get("DEEPSEEK_API_KEY") or env.get("DEEPSEEK_BASE_URL") or env.get("AZURE_TTS_KEY"):
+        if (env.get("DEEPSEEK_API_KEY") or env.get("DEEPSEEK_BASE_URL")
+                or env.get("AZURE_TTS_KEY") or env.get("WEBDAV_URL")):
             result = {}
             if env.get("DEEPSEEK_BASE_URL"):
                 result["api_base"] = env["DEEPSEEK_BASE_URL"]
@@ -322,6 +324,8 @@ def load_env_defaults() -> dict:
                 result["azure_tts_region2"] = env["AZURE_TTS_REGION2"]
             if env.get("PYREADER_PROXY"):
                 result["proxy"] = env["PYREADER_PROXY"]
+            if env.get("WEBDAV_URL"):
+                result["webdav_url"] = env["WEBDAV_URL"]
             return result
     return {}
 
