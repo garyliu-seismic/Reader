@@ -149,6 +149,7 @@ class MainWindow(QMainWindow):
                                read_only=self._shelf_lock is None)
         self.shelf.openRequested.connect(self._open_from_shelf)
         self.shelf.addLibraryRequested.connect(self._add_library_dir)
+        self.shelf.uploadStatus.connect(lambda text, ms: self.statusBar().showMessage(text, ms))
         self.stack = QStackedWidget()
         self.stack.addWidget(self.shelf)                 # 第 0 页：书架
         self.stack.addWidget(self.view)                  # 第 1 页：阅读页
@@ -899,6 +900,7 @@ class MainWindow(QMainWindow):
                 "webdav_url": dlg.webdav_url.text().strip(),
                 "webdav_user": dlg.webdav_user.text().strip(),
                 "webdav_password": dlg.webdav_password.text(),
+                "webdav_allow_insecure": dlg.webdav_allow_insecure.isChecked(),
                 "sync_user_name": dlg.sync_user_name.text().strip() or "default",
                 "device_name": dlg.device_name.text().strip() or syncmod.default_device_name(),
                 "shelf_default_view": dlg.shelf_view.currentData(),

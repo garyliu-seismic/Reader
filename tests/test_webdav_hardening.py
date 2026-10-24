@@ -325,6 +325,31 @@ def test_failed_mkcol_is_not_cached(server):
     assert "/dav/a/b" in h.dirs
 
 
+def test_mkcol_403_on_existing_dir_is_treated_as_exists(server):
+    """SFTPGo 对虚拟目录挂载点（如 /library）的 MKCOL 回 403：目录确实在 -> 视为已存在，上传才能继续。"""
+    h, url = server
+    h.dirs.add("/dav/library")
+    h.mkcol_existing_status = 403
+    c = WebDavClient(url)
+    assert c.mkcol("library") is False
+    c.mkdirs("library")                                          # 已记入缓存，不再发请求
+    n = len(h.log)
+    c.mkdirs("library")
+    assert len(h.log) == n
+
+
+def test_mkcol_403_on_missing_dir_still_raises(server):
+    """403 且目录并不存在：是真的权限问题，必须报错，不能当成已存在。"""
+    h, url = server
+    h.mkcol_forbidden.add("/dav/nope")
+    c = WebDavClient(url)
+    with pytest.raises(WebDavError) as ei:
+        c.mkcol("nope")
+    assert ei.value.status == 403
+    with pytest.raises(WebDavError):
+        c.mkdirs("nope")                                         # 失败不进缓存，下次仍会再试
+
+
 # ---------------- 重定向不泄露凭据 ----------------
 def _two_servers(auth="bob:secret"):
     s1, h1, u1 = fakedav.start(auth)
@@ -421,7 +446,15 @@ def test_client_refuses_credentials_over_plain_http_public(monkeypatch):
     assert len(calls) == 3
 
 
-def test_default_client_still_sends_credentials_to_plain_http(auth_server):
-    """默认 allow_insecure_auth=True（设置页确认入口出现前保持旧行为）。"""
+def test_default_client_refuses_plain_http_public_but_allows_private(auth_server, monkeypatch):
+    """默认 allow_insecure_auth=False：公网 http + 凭据被拒；本机/内网 http 不受影响。"""
     h, url = auth_server
     assert WebDavClient(url, "bob", "secret").exists("")
+    with pytest.raises(WebDavError, match="refusing"):
+        WebDavClient("http://example.com/dav", "bob", "pw").get("x")
+
+
+def test_client_from_cfg_insecure_opt_in():
+    cfg = {"webdav_enabled": True, "webdav_url": "http://example.com/dav", "webdav_user": "b", "webdav_password": "p"}
+    assert webdav.client_from_cfg(cfg).allow_insecure_auth is False
+    assert webdav.client_from_cfg({**cfg, "webdav_allow_insecure": True}).allow_insecure_auth is True

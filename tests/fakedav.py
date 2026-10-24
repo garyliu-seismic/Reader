@@ -11,6 +11,7 @@
   links           {link_path: target_path} 目录符号链接（可造出环）
   redirects       {path: absolute_url} GET 该路径时返回 302
   ignore_inm      True：PUT 忽略 If-None-Match（模拟不支持条件请求的服务器）
+  mkcol_existing_status / mkcol_forbidden  见类属性（模拟 SFTPGo 挂载点的 403）
   move_status     非 None：MOVE 一律返回这个状态码（如 405 / 501：模拟不支持 MOVE）
   no_etag         True：PROPFIND / 响应都不带 getetag（模拟不给 etag 的服务器）
   put_hooks       [f(path, data)]：每次 PUT 落盘之前依次调用（造「PUT 期间发生别的事」的竞态）；返回 bytes 则替换落盘内容（造截断）
@@ -43,6 +44,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     redirects = None
     ignore_inm = False
     move_status = None
+    mkcol_existing_status = 405       # 已存在目录的 MKCOL 返回码（SFTPGo 挂载点是 403）
+    mkcol_forbidden = None            # {path}：这些路径的 MKCOL 一律 403（目录并不存在）
     no_etag = False
     put_hooks = None
     move_hooks = None
@@ -156,8 +159,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not self._ok():
             return
         p = self._path()
+        if p in self.mkcol_forbidden:
+            return self._send(403)
         if p in self.dirs:
-            return self._send(405)
+            return self._send(self.mkcol_existing_status)
         parent = p.rsplit("/", 1)[0] or "/"
         if parent != "/" and parent not in self.dirs:
             return self._send(409)
@@ -219,7 +224,7 @@ def start(auth=None):
     h = type("H", (Handler,), {
         "files": {}, "dirs": set(), "auth": auth, "seen_auth": [], "mtimes": {}, "etags": {},
         "log": [], "fail_propfind": set(), "extra_entries": {}, "raw_propfind": {}, "links": {},
-        "redirects": {}, "put_hooks": [], "move_hooks": [], "req_headers": [], "counter": itertools.count(1), "now": staticmethod(time.time)})
+        "redirects": {}, "mkcol_forbidden": set(), "put_hooks": [], "move_hooks": [], "req_headers": [], "counter": itertools.count(1), "now": staticmethod(time.time)})
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), h)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv, h, "http://127.0.0.1:%d/dav" % srv.server_address[1]
