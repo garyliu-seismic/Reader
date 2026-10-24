@@ -246,6 +246,7 @@ DEFAULT_CONFIG = {"font_family": "", "font_size": 15,
                   # WebDAV 进度同步（默认关闭；这些键只存本机 config.json，绝不上传）
                   "webdav_enabled": False, "webdav_url": "",
                   "webdav_user": "", "webdav_password": "", "webdav_allow_insecure": False,
+                  "webdav_max_book_mb": 1024,
                   "sync_user_name": "default", "device_name": _default_device_name(),
                   # 书架（非机密的界面偏好；书架数据本身在 ~/.pyreader/shelf/，不进 config.json）
                   "shelf_default_view": "grid", "shelf_default_sort": "last_read",
