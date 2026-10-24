@@ -10,6 +10,7 @@
 用法：
   python build_installer.py               # 完整一键打包
   python build_installer.py --skip-build  # 跳过 PyInstaller，复用现有 dist/PyReader
+  python build_installer.py --portable-only  # 不生成安装包（未装 Inno Setup 时用），只出便携绿色版 zip
 """
 import os
 import sys
@@ -19,7 +20,7 @@ import zipfile
 import subprocess
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 PYINSTALLER = [sys.executable, "-m", "PyInstaller"]
 
 ISCC_CANDIDATES = [
@@ -49,6 +50,7 @@ def find_iscc():
 
 def main():
     skip_build = "--skip-build" in sys.argv
+    portable_only = "--portable-only" in sys.argv
     dist = os.path.join(ROOT, "dist", "PyReader")
     release = os.path.join(ROOT, "release")
     os.makedirs(release, exist_ok=True)
@@ -67,8 +69,11 @@ def main():
         raise SystemExit("未找到 dist/PyReader/PyReader.exe，打包失败？")
 
     # 3. Inno Setup 安装包
-    log("步骤 3/4：Inno Setup 生成安装包（含离线模型，需几分钟压缩）")
-    run([find_iscc(), "/Qp", "PyReader-setup.iss"])
+    if portable_only:
+        log("步骤 3/4：跳过 Inno Setup（--portable-only），不生成安装包")
+    else:
+        log("步骤 3/4：Inno Setup 生成安装包（含离线模型，需几分钟压缩）")
+        run([find_iscc(), "/Qp", "PyReader-setup.iss"])
 
     # 4. 便携绿色版
     log("步骤 4/4：生成便携绿色版 zip")
