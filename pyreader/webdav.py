@@ -111,9 +111,9 @@ def _cmp_key(s: str) -> str:
 
 class WebDavClient:
     def __init__(self, base_url: str, user: str = "", password: str = "", timeout: float = 20,
-                 allow_insecure_auth: bool = True):
-        """allow_insecure_auth=False：目标是 http:// 公网主机时拒绝发送凭据（设计要求的默认；
-        在设置页有「显式确认」入口之前，默认仍为 True 以保持现有行为）。"""
+                 allow_insecure_auth: bool = False):
+        """allow_insecure_auth=False：目标是 http:// 公网主机时拒绝发送凭据（默认；
+        设置页勾选「允许明文 http 发送密码」才会传 True）。"""
         self.base = (base_url or "").strip().rstrip("/")
         self.user = user or ""
         self.password = password or ""
@@ -417,4 +417,5 @@ def client_from_cfg(cfg: dict) -> Optional[WebDavClient]:
     """未启用或 url 为空 → None（调用方一律视为 no-op）。"""
     if not cfg.get("webdav_enabled") or not (cfg.get("webdav_url") or "").strip():
         return None
-    return WebDavClient(cfg["webdav_url"], cfg.get("webdav_user", ""), cfg.get("webdav_password", ""))
+    return WebDavClient(cfg["webdav_url"], cfg.get("webdav_user", ""), cfg.get("webdav_password", ""),
+                        allow_insecure_auth=bool(cfg.get("webdav_allow_insecure", False)))

@@ -899,6 +899,7 @@ class MainWindow(QMainWindow):
                 "webdav_url": dlg.webdav_url.text().strip(),
                 "webdav_user": dlg.webdav_user.text().strip(),
                 "webdav_password": dlg.webdav_password.text(),
+                "webdav_allow_insecure": dlg.webdav_allow_insecure.isChecked(),
                 "sync_user_name": dlg.sync_user_name.text().strip() or "default",
                 "device_name": dlg.device_name.text().strip() or syncmod.default_device_name(),
                 "shelf_default_view": dlg.shelf_view.currentData(),

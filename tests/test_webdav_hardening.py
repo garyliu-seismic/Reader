@@ -421,7 +421,15 @@ def test_client_refuses_credentials_over_plain_http_public(monkeypatch):
     assert len(calls) == 3
 
 
-def test_default_client_still_sends_credentials_to_plain_http(auth_server):
-    """默认 allow_insecure_auth=True（设置页确认入口出现前保持旧行为）。"""
+def test_default_client_refuses_plain_http_public_but_allows_private(auth_server, monkeypatch):
+    """默认 allow_insecure_auth=False：公网 http + 凭据被拒；本机/内网 http 不受影响。"""
     h, url = auth_server
     assert WebDavClient(url, "bob", "secret").exists("")
+    with pytest.raises(WebDavError, match="refusing"):
+        WebDavClient("http://example.com/dav", "bob", "pw").get("x")
+
+
+def test_client_from_cfg_insecure_opt_in():
+    cfg = {"webdav_enabled": True, "webdav_url": "http://example.com/dav", "webdav_user": "b", "webdav_password": "p"}
+    assert webdav.client_from_cfg(cfg).allow_insecure_auth is False
+    assert webdav.client_from_cfg({**cfg, "webdav_allow_insecure": True}).allow_insecure_auth is True

@@ -86,6 +86,8 @@ class SettingsDialog(QDialog):
         self.webdav_user.setPlaceholderText("匿名服务器可留空（用户名和密码都空则不发认证头）")
         self.webdav_password = QLineEdit(cfg.get("webdav_password", ""))
         self.webdav_password.setEchoMode(QLineEdit.Password)
+        self.webdav_allow_insecure = QCheckBox("允许明文 http 向公网主机发送密码（不安全，建议用 https）")
+        self.webdav_allow_insecure.setChecked(bool(cfg.get("webdav_allow_insecure", False)))
         self.sync_user_name = QLineEdit(cfg.get("sync_user_name", "default"))
         self.device_name = QLineEdit(cfg.get("device_name", ""))
         # 书架：默认视图 / 默认排序 / 启动时显示书架 / 重置
@@ -158,6 +160,7 @@ class SettingsDialog(QDialog):
         form.addRow("WebDAV 地址", self.webdav_url)
         form.addRow("WebDAV 用户名", self.webdav_user)
         form.addRow("WebDAV 密码", self.webdav_password)
+        form.addRow("", self.webdav_allow_insecure)
         form.addRow("同步用户名", self.sync_user_name)
         form.addRow("设备名", self.device_name)
         form.addRow("书架", QLabel("（默认视图 / 排序在改动后立即应用）"))
