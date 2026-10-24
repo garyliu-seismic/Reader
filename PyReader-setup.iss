@@ -3,7 +3,7 @@
 ; 产物：release\PyReader-Setup-<版本>.exe
 
 #define MyAppName "PyReader"
-#define MyAppVersion "0.3.0"
+#define MyAppVersion "0.4.0"
 #define MyAppPublisher "garyliu"
 #define MyAppExeName "PyReader.exe"
 
