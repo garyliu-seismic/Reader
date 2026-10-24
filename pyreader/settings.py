@@ -88,6 +88,11 @@ class SettingsDialog(QDialog):
         self.webdav_password.setEchoMode(QLineEdit.Password)
         self.webdav_allow_insecure = QCheckBox("允许明文 http 向公网主机发送密码（不安全，建议用 https）")
         self.webdav_allow_insecure.setChecked(bool(cfg.get("webdav_allow_insecure", False)))
+        self.webdav_max_book = QComboBox()
+        for mb, label in ((1024, "1 GB"), (4096, "4 GB"), (10240, "10 GB（有声书 / 漫画 ZIP）"), (-1, "不限制")):
+            self.webdav_max_book.addItem(label, mb)
+        mi = self.webdav_max_book.findData(cfg.get("webdav_max_book_mb", 1024))
+        self.webdav_max_book.setCurrentIndex(mi if mi >= 0 else 0)
         self.sync_user_name = QLineEdit(cfg.get("sync_user_name", "default"))
         self.device_name = QLineEdit(cfg.get("device_name", ""))
         # 书架：默认视图 / 默认排序 / 启动时显示书架 / 重置
@@ -197,6 +202,7 @@ class SettingsDialog(QDialog):
         add(net, "WebDAV 用户名", self.webdav_user)
         add(net, "WebDAV 密码", self.webdav_password)
         add(net, "", self.webdav_allow_insecure)
+        add(net, "单个文件上限", self.webdav_max_book)
         add(net, "同步用户名", self.sync_user_name)
         add(net, "设备名", self.device_name)
 

@@ -20,6 +20,18 @@ from .webdav import WebDavClient, WebDavError, client_from_cfg
 
 REMOTE_BOOKS_DIR = os.path.join(APP_DIR, "remote_books")
 MAX_BOOK_BYTES = 1024 * 1024 * 1024      # 单本书下载上限（流式写盘，不进内存）；cfg["webdav_max_book_mb"] 可覆盖
+UNLIMITED_BOOK_MB = -1                   # cfg["webdav_max_book_mb"] 取该值 = 不限制
+
+
+def max_book_bytes(cfg) -> int:
+    """cfg["webdav_max_book_mb"] -> 字节上限：缺省/0/非法 = 1GB，<0 = 不限制。"""
+    try:
+        mb = int(cfg.get("webdav_max_book_mb") or 0)
+    except (TypeError, ValueError):
+        mb = 0
+    if mb < 0:
+        return 1 << 62
+    return mb * 1024 * 1024 if mb > 0 else MAX_BOOK_BYTES
 
 
 def default_device_name() -> str:
