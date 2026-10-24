@@ -69,8 +69,13 @@ class Listing:
         return "；".join(parts) or "云端列表不完整"
 
 
-def _is_unstable(rf: sh.RemoteFile, prev_sizes: Optional[Dict[str, int]], now: float) -> bool:
-    """半截上传判断（design §4.3 步骤 1）：mtime 距今 < 60s，或大小与上一轮列表不同。"""
+def _is_unstable(rf: sh.RemoteFile, prev_sizes: Optional[Dict[str, int]], now: float,
+                 trusted: Optional[Dict[str, int]] = None) -> bool:
+    """半截上传判断（design §4.3 步骤 1）：mtime 距今 < 60s，或大小与上一轮列表不同。
+    trusted：本设备刚上传并核对过大小的 {rel: 大小}；大小仍相符就一定是完整文件（MOVE 会把 mtime 设成完成时刻，
+    不加这一条，刚传完的那本会被当成「上传中」藏 60 秒）。"""
+    if trusted and trusted.get(rf.rel) == rf.size:
+        return False
     if rf.mtime and rf.mtime > 0:
         age = now - rf.mtime
         if -CLOCK_SLACK < age < STABLE_SECONDS:
@@ -80,14 +85,15 @@ def _is_unstable(rf: sh.RemoteFile, prev_sizes: Optional[Dict[str, int]], now: f
 
 
 def fetch_library(client: WebDavClient, prev_sizes: Optional[Dict[str, int]] = None,
-                  now: Optional[float] = None, max_files: int = MAX_FILES) -> Listing:
+                  now: Optional[float] = None, max_files: int = MAX_FILES,
+                  trusted: Optional[Dict[str, int]] = None) -> Listing:
     """列 <base>/library。阻塞调用，只能在后台线程用。网络 / 协议错误抛 WebDavError（调用方负责接住）；
     library 目录不存在（404）不抛，返回 root_missing 的不完整列表。
 
     名字过滤：BOOK_EXTS、点 / ~$ 开头、rel 校验（valid_remote_rel）。稳定性：见 _is_unstable。"""
     now = time.time() if now is None else now
     try:
-        tree = client.list_tree_ex(LIBRARY, max_files=max_files)
+        tree = client.list_tree_ex(LIBRARY, max_files=max_files, accept=sh.valid_remote_rel)    # 非书文件不占 max_files 名额
     except WebDavError as e:
         if e.status == 404:
             return Listing(complete=False, root_missing=True, fetched_at=now)
@@ -102,7 +108,7 @@ def fetch_library(client: WebDavClient, prev_sizes: Optional[Dict[str, int]] = N
         seen.add(rel)
         out.append(sh.RemoteFile(rel, int(ent.size or 0), float(ent.mtime or 0.0)))
     out.sort(key=lambda f: f.rel)
-    unstable = {f.rel for f in out if _is_unstable(f, prev_sizes, now)}
+    unstable = {f.rel for f in out if _is_unstable(f, prev_sizes, now, trusted)}
     return Listing(out, unstable, bool(tree.complete), bool(tree.truncated), list(tree.errors), skipped, False, now)
 
 
@@ -615,7 +621,7 @@ def normalize_folder(folder) -> Optional[str]:
 
 
 def upload_rel(folder, name) -> Optional[str]:
-    """合法的上传目标 library 相对路径；名字 / 文件夹不合法、扩展名不是电子书、.part 名会超长都返回 None。"""
+    """合法的上传目标 library 相对路径；名字 / 文件夹不合法、扩展名不在 BOOK_EXTS（电子书 / 有声书 / 漫画压缩包）内、.part 名会超长都返回 None。"""
     f = normalize_folder(folder)
     if f is None or not isinstance(name, str) or len(name) > 240 or name != name.strip() or safe_segment(name) is None:
         return None                                       # name 必须是单段名字：不能带 / \ : 等
@@ -656,7 +662,7 @@ def upload_book_safe(client: WebDavClient, path: str, folder, name: str, *, max_
     now = time.time() if now is None else now
     rel = upload_rel(folder, name)
     if rel is None:
-        return UploadResult("error", "", "名字或文件夹不合法（只允许电子书扩展名，不能含 / \\ : 等字符，不能以 . 开头）")
+        return UploadResult("error", "", "名字或文件夹不合法（只允许电子书 / 有声书 / 漫画压缩包扩展名，不能含 / \\ : 等字符，不能以 . 开头）")
     f = normalize_folder(folder)
     try:
         size = os.path.getsize(path)
@@ -721,6 +727,53 @@ def upload_book_safe(client: WebDavClient, path: str, folder, name: str, *, max_
         return UploadResult("error", rel, f"上传失败：{e}")
 
 
+# ================================================================== 批量上传计划（纯函数，不碰网络）
+@dataclass
+class BatchPlan:
+    items: List[tuple] = field(default_factory=list)                 # [(本机路径, 云端文件夹, 云端文件名)]
+    total_bytes: int = 0
+    skipped: Dict[str, List[str]] = field(default_factory=dict)      # 跳过原因 -> 文件名（同一原因里按出现顺序）
+
+    def skip(self, why: str, name: str) -> None:
+        self.skipped.setdefault(why, []).append(name)
+
+
+def limit_text(max_bytes: int) -> str:
+    """单个文件超限的统一说法（批量跳过原因 / 单本上传 / 下载共用），告诉用户限制来自哪个设置。"""
+    return f"超过单个文件上限（{max_bytes // (1024 * 1024)} MB），可在 设置 > 同步与网络 里调大"
+
+
+def plan_batch_upload(files: Iterable, cloud_rels: Iterable[str], max_bytes: int, prefix: str = "",
+                      is_cached: Optional[Callable[[str], bool]] = None) -> BatchPlan:
+    """把本机文件（sh.LocalFile）整理成批量上传计划：云端文件夹 = prefix/<书库根下的子文件夹>，保持本地目录结构。
+    跳过：云端已有同名（NFC + 忽略大小写）、云端缓存副本、空文件、超过 max_bytes、名字 / 文件夹不合法、
+    本批里目标重名。绝不会产生覆盖已有文件的条目（upload_book_safe 还会再确认一次）。"""
+    plan = BatchPlan()
+    have = {_nkey(r) for r in cloud_rels}
+    seen: Set[str] = set()
+    for lf in files:
+        if is_cached is not None and is_cached(lf.path):
+            plan.skip("已经是云端缓存副本", lf.name)
+            continue
+        folder = normalize_folder("/".join(x for x in (prefix, lf.sub) if x))
+        rel = upload_rel(folder, lf.name) if folder is not None else None
+        if rel is None:
+            plan.skip("名字或文件夹不合法", lf.name)
+        elif _nkey(rel) in have:
+            plan.skip("云端已有同名文件", lf.name)
+        elif _nkey(rel) in seen:
+            plan.skip("本批里重名", lf.name)
+        elif lf.size <= 0:
+            plan.skip("文件是空的", lf.name)
+        elif lf.size > max_bytes:
+            plan.skip(limit_text(max_bytes), lf.name)
+        else:
+            seen.add(_nkey(rel))
+            plan.items.append((lf.path, folder, lf.name))
+            plan.total_bytes += lf.size
+    return plan
+
+
 @dataclass
 class ProgressResult:
     """一轮进度同步的结果（后台线程 -> 主线程）。"""
@@ -740,6 +793,7 @@ class ShelfSyncWorker(QObject):
     listFailed = Signal(str)             # 列表读取失败（离线 / 认证 / 服务器错误）：调用方保留本地缓存
     downloadedFor = Signal(object, str)  # (token, 本地路径)：与永久接到 load_book 的 SyncWorker.downloaded 无关
     downloadFailed = Signal(object, str)  # (token, 提示)
+    downloadProgress = Signal(object, int, int)   # (token, 已收字节, 总字节)：下载中，已节流
     status = Signal(str)
     progressPulled = Signal(object)      # ProgressResult：其它设备的摘要 + 逐书补缺的进度
     progressFailed = Signal(str)         # 进度同步失败（离线 / 认证 / 用户名不合法）：调用方保留本地缓存
@@ -756,6 +810,7 @@ class ShelfSyncWorker(QObject):
         self._rerun = False
         self._cfg: Optional[dict] = None
         self._prev_sizes: Dict[str, int] = {}
+        self._trusted: Dict[str, int] = {}                 # 本设备上传成功（已核对大小）的 rel -> 大小：列表里不当作「上传中」
         self._downloads: Dict[str, List[object]] = {}      # rel -> 等这次下载的 token 们（同一文件只下载一次）
         self.generation = 0                                # 每完成一轮列表 +1（测试用）
         self.progress_generation = 0                       # 每完成一轮进度同步 +1（测试用）
@@ -791,7 +846,7 @@ class ShelfSyncWorker(QObject):
                 client = self._factory(cfg)
                 if client is None:
                     raise WebDavError("WebDAV 未启用")
-                lst = fetch_library(client, self._prev_sizes)
+                lst = fetch_library(client, self._prev_sizes, trusted=dict(self._trusted))
                 self._prev_sizes = {f.rel: f.size for f in lst.files}
                 self.generation += 1
                 self.listed.emit(lst)
@@ -826,8 +881,20 @@ class ShelfSyncWorker(QObject):
 
         def run():
             path, err = "", ""
+            last = [-1, 0.0]
+
+            def report(done, total):         # 节流：百分比变化且距上次 > 0.3 秒；GB 级文件不能每块都发信号
+                pct = done * 100 // total if total > 0 else -1
+                now = time.monotonic()
+                if pct == last[0] or now - last[1] < 0.3:
+                    return
+                last[0], last[1] = pct, now
+                with self._lock:
+                    toks = list(self._downloads.get(rel, ()))
+                for tok in toks:
+                    self.downloadProgress.emit(tok, done, total)
             try:
-                path = download_book(client, rel, size, max_bytes=max_bytes)
+                path = download_book(client, rel, size, max_bytes=max_bytes, progress=report)
             except Exception as e:
                 _log_net(f"[书架] 下载失败 {rel}: {e}")
                 err = f"下载失败：{rel.rsplit('/', 1)[-1]}（{str(e)[:120]}）"
@@ -979,6 +1046,11 @@ class ShelfSyncWorker(QObject):
             except Exception as e:
                 _log_net(f"[书架] 上传异常 {name}: {e}")
                 res = UploadResult("error", name, f"上传失败：{str(e)[:120]}")
+            if res.status == "ok":
+                try:
+                    self._trusted[res.rel] = os.path.getsize(path)
+                except OSError:
+                    pass
             try:
                 self.uploadDone.emit(token, res)
             except Exception:
