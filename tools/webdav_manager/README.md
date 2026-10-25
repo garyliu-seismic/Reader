@@ -1,8 +1,9 @@
-# WebDAV library manager
+# WebDAV file manager
 
-Standalone tools (not part of the PyReader app) for managing the shared WebDAV book library
-(SFTPGo behind Caddy). Remote layout: `library/` (shared books, subfolders = shelves),
-`u-<name>/` (per-user data).
+Standalone tools (not part of the PyReader app) for managing files on the WebDAV store
+(SFTPGo behind Caddy): books, photos, anything. Any remote path works; typical layout:
+`library/` (books, subfolders = shelves, the only folder PyReader reads), `photo/` (private
+photos, per user, invisible to PyReader), `users/<name>/` (PyReader progress and shelf data).
 
     pip install webdavclient3 PySide6      # PySide6 only for the GUI
 
