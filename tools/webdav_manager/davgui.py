@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""davgui - visual manager for the PyReader WebDAV book library (PySide6).
+"""davgui - visual manager for the PyReader WebDAV file store: books, photos, anything (PySide6).
 
 Run:  python davgui.py
 Optional env vars (same as davlib.py): DAV_URL, DAV_USER, DAV_PASS.  When user and password are
@@ -47,7 +47,7 @@ except Exception:  # pragma: no cover
     keyring = None
 
 CONFIG = Path.home() / ".davgui.json"
-APP_NAME = "PyReader Library Manager"
+APP_NAME = "WebDAV File Manager"
 ROLE_ENTRY, ROLE_SORT, ROLE_PATH, ROLE_LOADED = (Qt.UserRole, Qt.UserRole + 1, Qt.UserRole, Qt.UserRole + 1)
 Entry = namedtuple("Entry", "name is_dir size mtime")
 

@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Small CLI to manage the PyReader WebDAV book library (SFTPGo behind Caddy).
+"""Small CLI to manage files on the PyReader WebDAV store: books, photos, anything (SFTPGo behind Caddy).
 
 Config via env vars (keep credentials out of the command line):
     DAV_URL   default https://gary-pyreader.eastasia.cloudapp.azure.com/
     DAV_USER  e.g. gary
     DAV_PASS
 
-Remote layout: library/ (shared books, subfolders = shelves), u-<name>/ (per-user data).
+Remote layout: library/ (shared books, subfolders = shelves), photo/ (private photos), u-<name>/ (per-user data).
 
 Examples:
-    python davlib.py ls library
+    python davlib.py ls library        # any path works, e.g. photo/2026
     python davlib.py tree library
     python davlib.py up D:\\books\\foo.epub library/Novels
     python davlib.py up D:\\books library --skip-existing
