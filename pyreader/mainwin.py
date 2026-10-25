@@ -499,13 +499,17 @@ class MainWindow(QMainWindow):
         self._media = {"path": path, "kind": kind, "bid": syncmod.book_id(path), "start": start, "pos": start, "dur": 0,
                        "page": start, "count": self.comic.page_count() if kind == "comic" else 0,
                        "saved_at": None, "pushed_at": None, "dirty": False, "push_due": False,
-                       "closing": False, "touched": False, "applying": False}
+                       "closing": False, "touched": False, "applying": False, "autoplay": False}
         self._text_active = False
         self.stack.setCurrentWidget(self._media_widget(kind))
         self._sync_page_state()
         self.setWindowTitle(os.path.basename(path) + " — PyReader")
         self._media_widget(kind).setFocus()
-        self.sync.pull(self.cfg, path)       # 未启用时是 no-op；别的设备读得更远则在没动过之前跳过去
+        pulling = self.sync.pull(self.cfg, path)       # 未启用时是 no-op；别的设备读得更远则在没动过之前跳过去
+        if kind == "audio" and self.cfg.get("audio_autoplay", True):
+            # 打开即播放：启用同步时等远端位置回来（可能先跳到别的设备的位置）再播，最多等 4 秒；没启用同步则马上播
+            self._media["autoplay"] = True
+            QTimer.singleShot(4000 if pulling else 0, lambda m=self._media: self._autoplay_audio(m))
         self.statusBar().showMessage(os.path.basename(path), 4000)
 
     def _apply_comic_options(self):
@@ -536,6 +540,15 @@ class MainWindow(QMainWindow):
         m["dirty"] = True
         if not m["closing"]:
             self._save_media_progress(force=False)
+
+    def _autoplay_audio(self, m):
+        """打开音频后自动开始播放：只在这次打开仍是当前媒体、没被关掉、用户还没自己操作过时执行一次。"""
+        if m is not self._media or not m.get("autoplay"):
+            return
+        m["autoplay"] = False
+        if m["closing"] or m["touched"] or self.audio is None:
+            return
+        self.audio.play()
 
     def _on_audio_seeked(self):
         if self._media is not None and self._media["kind"] == "audio" and not self._media["closing"]:
@@ -822,6 +835,7 @@ class MainWindow(QMainWindow):
     def _on_remote_progress(self, book_path, remote):
         if self._media is not None and book_path == self._media["path"]:
             self._apply_remote_media(remote)
+            self._autoplay_audio(self._media)
             return
         if remote is None and book_path == self.book_path and self._seed_push == book_path:
             self._seed_remote_none = True        # 远端没有这本书的进度：种入的本地进度要推上去
